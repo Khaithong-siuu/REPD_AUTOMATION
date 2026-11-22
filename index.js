@@ -1,71 +1,59 @@
 require('dotenv').config();
-const noblox = require('noblox.js');
+const fs = require('fs');
+const path = require('path');
 const http = require('http');
+const noblox = require('noblox.js');
 
 const GROUP_ID = parseInt(process.env.GROUP_ID, 10);
-const BASE_RANK_ID = 1;
-const TARGET_RANK_ID = 2;
-const CHECK_INTERVAL_MS = 2500; // 2.5s avoids aggressive Roblox 429 rate limiting
-const RANK_COOLDOWN_MS = 15000;
-const AUDIT_CHECK_INTERVAL_MS = 15000;
-const LOG_SEND_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
-const STATUS_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
-const MAX_RETRIES = 4;
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
-// How long to keep an unpaired Unassign/Assign before discarding it
-const RANK_PAIR_TIMEOUT_MS = 90 * 1000;
+const BASE_RANK_ID = 1;
+const TARGET_RANK_ID = 2;
+const CHECK_INTERVAL_MS = 1500;
+const RANK_COOLDOWN_MS = 15000;
+const REPORT_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const MAX_RETRIES = 4;
 
-// Fail early with a clear message
+// Remembers the last reported member count so a restart doesn't reset the change figure.
+// On hosts with a temporary disk (Render free tier) this resets on redeploy, which is fine.
+const STATE_FILE = path.join(__dirname, 'state.json');
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ==================================================
+// CONFIG CHECK
+// ==================================================
 if (!Number.isInteger(GROUP_ID) || GROUP_ID <= 0) {
-    console.error('[CONFIG] GROUP_ID is missing or not a number. Set it in your .env / Render environment.');
+    console.error('[CONFIG] GROUP_ID is missing or not a number.');
     process.exit(1);
 }
 if (!process.env.ROBLOX_COOKIE) {
-    console.error('[CONFIG] ROBLOX_COOKIE is missing. Set it in your .env / Render environment.');
+    console.error('[CONFIG] ROBLOX_COOKIE is missing.');
     process.exit(1);
 }
 if (!DISCORD_WEBHOOK_URL) {
-    console.warn('[CONFIG] DISCORD_WEBHOOK_URL is not set - logs will only be printed to the console.');
+    console.warn('[CONFIG] DISCORD_WEBHOOK_URL is not set. Reports will only be printed to the console.');
 }
-
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ==================================================
 // STATE
 // ==================================================
-let botUserId = null;
-let botUsername = null;
 const processingSet = new Set();
 const recentlyRanked = new Map();
+const roleNames = {}; // rank number -> role name, used for the promotion log
 let baseRoleSetId = null;
 let isPolling = false;
-
-// Audit logger state
-let auditLoggerReady = false;
-let lastAuditCreated = null;
-const processedAuditLogs = new Set();
-
-// Logs waiting for the next 2-minute Discord message
-const pendingLogs = [];
-
-// Pending rank-change pairs
-const pendingRankChanges = new Map();
-
-// Roles cache for accurate Promotion/Demotion detection
-let rolesCache = null;
-let rolesCacheTime = 0;
-const ROLES_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+let isReporting = false;
 
 // ==================================================
-// DUMMY SERVER FOR RENDER
+// SERVER FOR RENDER (keeps the web service alive)
 // ==================================================
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Roblox Auto-Ranker + Logger is running');
+    res.end('REPD ranker is running');
 }).listen(PORT, () => {
-    console.log(`[SYSTEM] Dummy server running on port ${PORT}`);
+    console.log(`[SYSTEM] Web server listening on port ${PORT}`);
 });
 
 // ==================================================
@@ -73,19 +61,8 @@ http.createServer((req, res) => {
 // ==================================================
 function getUserId(player) {
     if (!player) return null;
-    const id = player.userId || player.id || player.user?.userId || player.user?.id;
+    const id = player.userId || player.id;
     return id ? Number(id) : null;
-}
-
-function getPlayerUsername(player) {
-    if (!player) return 'Unknown';
-    return (
-        player.username ||
-        player.name ||
-        player.user?.username ||
-        player.user?.name ||
-        `User ${getUserId(player)}`
-    );
 }
 
 async function withRetry(fn, label = 'API call') {
@@ -95,15 +72,13 @@ async function withRetry(fn, label = 'API call') {
         } catch (err) {
             const msg = err?.message || String(err);
             const status = err?.httpStatusCode || err?.statusCode || err?.response?.status;
-            const isTransient =
+            const transient =
                 [429, 500, 502, 503, 504].includes(status) ||
                 ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN', 'ENOTFOUND'].includes(err?.code) ||
                 /InternalServerError|Internal Server Error|Too many requests|socket hang up|timed? ?out/i.test(msg);
-            if (isTransient && attempt < MAX_RETRIES) {
+            if (transient && attempt < MAX_RETRIES) {
                 const delay = 1200 * attempt;
-                console.warn(
-                    `[RETRY ${attempt}/${MAX_RETRIES}] ${label} → ${status || err?.code || 'transient error'}. Waiting ${delay}ms...`
-                );
+                console.warn(`[RETRY ${attempt}/${MAX_RETRIES}] ${label}: ${status || err?.code || 'transient error'}. Waiting ${delay}ms`);
                 await sleep(delay);
                 continue;
             }
@@ -112,172 +87,161 @@ async function withRetry(fn, label = 'API call') {
     }
 }
 
-// ==================================================
-// ROLES CACHE
-// ==================================================
-async function getRolesCached() {
-    if (rolesCache && Date.now() - rolesCacheTime < ROLES_CACHE_TTL) {
-        return rolesCache;
-    }
+function loadState() {
     try {
-        const roles = await withRetry(
-            () => noblox.getRoles(GROUP_ID),
-            'getRoles'
-        );
-        rolesCache = roles;
-        rolesCacheTime = Date.now();
-        console.log(`[ROLES] Cached ${roles.length} roles`);
-        return roles;
+        return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
+function saveState(state) {
+    try {
+        fs.writeFileSync(STATE_FILE, JSON.stringify(state));
     } catch (err) {
-        console.warn('[ROLES] Failed to refresh roles cache:', err.message || err);
-        return rolesCache || [];
+        console.warn('[STATE] Could not save state:', err.message || err);
     }
-}
-
-function getRankNumberByName(roles, roleName) {
-    if (!roleName || !roles?.length) return null;
-    const found = roles.find(
-        r => r.name?.toLowerCase() === String(roleName).toLowerCase()
-    );
-    return found ? Number(found.rank) : null;
 }
 
 // ==================================================
-// DISCORD QUEUE
+// DISCORD (plain text only)
 // ==================================================
-const discordQueue = [];
-let isProcessingDiscord = false;
-
-async function processDiscordQueue() {
-    if (isProcessingDiscord || discordQueue.length === 0) {
-        return;
-    }
-    isProcessingDiscord = true;
-
-    try {
-        while (discordQueue.length > 0) {
-            const { content, embeds, resolve } = discordQueue.shift();
-            try {
-                const res = await fetch(DISCORD_WEBHOOK_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        content: content || undefined,
-                        embeds: embeds?.length ? embeds : undefined,
-                        username: 'Group Logger'
-                    })
-                });
-
-                if (res.status === 429) {
-                    let retryAfter = Number(res.headers.get('Retry-After') || 5);
-                    if (retryAfter > 60) retryAfter = 60;
-                    console.warn(`[DISCORD] Rate limited. Waiting ${retryAfter}s...`);
-                    discordQueue.unshift({ content, embeds, resolve });
-                    await sleep(retryAfter * 1000);
-                    continue;
-                }
-
-                if (!res.ok) {
-                    const text = await res.text();
-                    throw new Error(`Discord ${res.status}: ${text}`);
-                }
-                resolve(true);
-            } catch (err) {
-                console.error('[DISCORD] Failed to send:', err.message || err);
-                resolve(false);
-            }
-            await sleep(1500);
-        }
-    } finally {
-        isProcessingDiscord = false;
-    }
-}
-
-async function sendDiscord(content, embeds = []) {
+async function sendDiscord(content) {
     if (!DISCORD_WEBHOOK_URL) {
-        console.warn('[DISCORD] No DISCORD_WEBHOOK_URL set');
-        return;
+        console.log(`[REPORT] ${content}`);
+        return true;
     }
-    return new Promise((resolve) => {
-        discordQueue.push({ content, embeds, resolve });
-        processDiscordQueue();
-    });
-}
 
-// ==================================================
-// EMBED
-// ==================================================
-function makeEmbed(title, description, color = 0x5865F2) {
-    return {
-        title,
-        description,
-        color,
-        timestamp: new Date().toISOString(),
-        footer: { text: 'Group Logger' }
-    };
-}
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+            const res = await fetch(DISCORD_WEBHOOK_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            });
 
-// ==================================================
-// LOG QUEUE
-// ==================================================
-function addPendingLog(message) {
-    if (!message) return;
-    pendingLogs.push(message);
-    console.log(`[LOG QUEUED] ${message}`);
-}
-
-let isSendingLogs = false;
-const MAX_PENDING_LOGS = 500;
-
-async function sendBatchedLogs() {
-    if (isSendingLogs || pendingLogs.length === 0) {
-        return;
+            if (res.status === 429) {
+                const retryAfter = Math.min(Number(res.headers.get('Retry-After') || 5), 60);
+                console.warn(`[DISCORD] Rate limited. Waiting ${retryAfter}s`);
+                await sleep(retryAfter * 1000);
+                continue;
+            }
+            if (!res.ok) {
+                throw new Error(`Discord ${res.status}: ${await res.text()}`);
+            }
+            return true;
+        } catch (err) {
+            console.error(`[DISCORD] Send failed (attempt ${attempt}/${MAX_RETRIES}):`, err.message || err);
+            await sleep(2000 * attempt);
+        }
     }
-    isSendingLogs = true;
+    return false;
+}
+
+// Rank change line: "username: Old -> New (promotion)".
+// Discord only colors text inside an ansi code block: green for a promotion, red for a demotion.
+// Lines are collected and posted together as ONE message every minute.
+const LOG_FLUSH_MS = 60 * 1000;
+const logQueue = []; // { name, text, color }
+let isFlushing = false;
+
+function queueLog(name, text, color) {
+    logQueue.push({ name, text, color });
+}
+
+function queueRankLog(username, fromName, toName, type) {
+    queueLog(username, `${fromName} -> ${toName} (${type})`, type === 'demotion' ? 31 : 32); // 31 = red, 32 = green
+}
+
+async function flushLogQueue() {
+    if (isFlushing || logQueue.length === 0) return;
+    isFlushing = true;
 
     try {
-        const uniqueLogs = [...new Set(pendingLogs)];
-        pendingLogs.length = 0;
+        const batch = logQueue.splice(0, logQueue.length);
 
-        if (!DISCORD_WEBHOOK_URL) {
-            return;
-        }
-
+        // Discord allows 2000 characters per message, so a very large batch is split in chunks
         const chunks = [];
         let current = [];
         let length = 0;
-        for (const line of uniqueLogs) {
-            const safeLine = line.length > 500 ? line.slice(0, 497) + '...' : line;
-            if (length + safeLine.length + 1 > 3800 && current.length > 0) {
+        for (const entry of batch) {
+            const size = entry.name.length + entry.text.length + 20;
+            if (current.length && length + size > 1800) {
                 chunks.push(current);
                 current = [];
                 length = 0;
             }
-            current.push(safeLine);
-            length += safeLine.length + 1;
+            current.push(entry);
+            length += size;
         }
-        if (current.length > 0) chunks.push(current);
-
-        console.log(`[DISCORD] Sending ${uniqueLogs.length} logs in ${chunks.length} message(s)...`);
+        if (current.length) chunks.push(current);
 
         for (let i = 0; i < chunks.length; i++) {
-            const title = chunks.length > 1 ? `📋 Logs (${i + 1}/${chunks.length})` : '📋 Logs';
-            const ok = await sendDiscord(null, [
-                makeEmbed(title, chunks[i].join('\n'), 0x5865F2)
-            ]);
+            const body = chunks[i]
+                .map((e) => `${e.name}: \u001b[0;${e.color}m${e.text}\u001b[0m`)
+                .join('\n');
+            const ok = await sendDiscord('```ansi\n' + body + '\n```');
             if (!ok) {
-                const unsent = chunks.slice(i).flat();
-                pendingLogs.unshift(...unsent);
-                if (pendingLogs.length > MAX_PENDING_LOGS) {
-                    pendingLogs.splice(0, pendingLogs.length - MAX_PENDING_LOGS);
-                }
-                console.warn(`[DISCORD] Send failed, ${unsent.length} log(s) re-queued.`);
+                // Keep the unsent lines and try again on the next flush
+                logQueue.unshift(...chunks.slice(i).flat());
                 break;
             }
         }
     } finally {
-        isSendingLogs = false;
+        isFlushing = false;
     }
+}
+
+// ==================================================
+// 2-HOUR MEMBER REPORT
+// Format: Redwood Edge Police Department [REPD]: 126[+1]
+// ==================================================
+async function sendMemberReport() {
+    if (isReporting) return;
+    isReporting = true;
+
+    try {
+        const group = await withRetry(() => noblox.getGroup(GROUP_ID), 'getGroup');
+        const total = Number(group.memberCount);
+        if (!Number.isFinite(total)) {
+            throw new Error('Group member count was not returned');
+        }
+
+        const previous = loadState();
+        const change = previous && Number.isFinite(previous.count) ? total - previous.count : 0;
+        const sign = change < 0 ? '-' : '+';
+
+        const line = `${group.name}: ${total}[${sign}${Math.abs(change)}]`;
+        // Same colored style as the promotion log: green for + (or no change), red for -
+        const color = change < 0 ? 31 : 32;
+        const sent = await sendDiscord(
+            '```ansi\n' + `${group.name}: \u001b[0;${color}m${total}[${sign}${Math.abs(change)}]\u001b[0m` + '\n```'
+        );
+
+        if (sent) {
+            // Only move the baseline once the report actually went out
+            saveState({ count: total, at: Date.now() });
+            console.log(`[REPORT] ${line}`);
+        }
+    } catch (err) {
+        console.error('[REPORT] Failed:', err.message || err);
+    } finally {
+        isReporting = false;
+    }
+}
+
+function scheduleReports() {
+    const state = loadState();
+    const age = state?.at ? Date.now() - state.at : Infinity;
+
+    // First report shortly after start, unless one went out recently (restart / redeploy)
+    const firstDelay = age >= REPORT_INTERVAL_MS ? 30 * 1000 : REPORT_INTERVAL_MS - age;
+    console.log(`[SYSTEM] Next member report in ${Math.round(firstDelay / 60000)} minute(s)`);
+
+    setTimeout(() => {
+        sendMemberReport();
+        setInterval(sendMemberReport, REPORT_INTERVAL_MS);
+    }, firstDelay);
 }
 
 // ==================================================
@@ -286,20 +250,18 @@ async function sendBatchedLogs() {
 async function getRank1Members() {
     try {
         if (!baseRoleSetId) {
-            const roles = await getRolesCached();
-            const baseRole = roles.find(r => r.rank === BASE_RANK_ID);
+            const roles = await withRetry(() => noblox.getRoles(GROUP_ID), 'getRoles');
+            const baseRole = roles.find((r) => r.rank === BASE_RANK_ID);
             if (!baseRole) {
                 throw new Error(`Role for Rank ${BASE_RANK_ID} not found.`);
             }
             baseRoleSetId = baseRole.id;
-            console.log(
-                `[SYSTEM] Cached roleset ID for Rank ${BASE_RANK_ID}: ${baseRoleSetId}`
-            );
+            for (const r of roles) roleNames[r.rank] = r.name;
+            console.log(`[SYSTEM] Rank ${BASE_RANK_ID} roleset ID: ${baseRoleSetId}`);
         }
 
-        // 'Desc' ensures newest members in Rank 1 are fetched first
         const members = await withRetry(
-            () => noblox.getPlayers(GROUP_ID, baseRoleSetId, 'Desc', 100),
+            () => noblox.getPlayers(GROUP_ID, baseRoleSetId),
             'getPlayers'
         );
         return Array.isArray(members) ? members : [];
@@ -309,593 +271,221 @@ async function getRank1Members() {
     }
 }
 
-async function rankMember(userId, username) {
-    userId = Number(userId);
-    if (!userId || userId === botUserId) {
-        return;
-    }
+// Members the bot has already ranked are remembered on disk, so a restart (or a staff
+// change that still leaves them showing as rank 1) never makes the bot rank them again.
+const RANKED_FILE = path.join(__dirname, 'ranked.json');
+const RANKED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+let rankedBefore = {};
+try { rankedBefore = JSON.parse(fs.readFileSync(RANKED_FILE, 'utf8')); } catch { rankedBefore = {}; }
 
-    if (processingSet.has(userId)) {
-        return;
-    }
+function markRanked(userId) {
+    rankedBefore[userId] = Date.now();
+    try { fs.writeFileSync(RANKED_FILE, JSON.stringify(rankedBefore)); } catch {}
+}
+
+async function rankMember(userId, username) {
+    if (processingSet.has(userId)) return;
+
+    const prev = rankedBefore[userId];
+    if (prev && Date.now() - prev < RANKED_TTL_MS) return;
 
     const lastRanked = recentlyRanked.get(userId);
-    if (lastRanked && Date.now() - lastRanked < RANK_COOLDOWN_MS) {
-        return;
-    }
+    if (lastRanked && Date.now() - lastRanked < RANK_COOLDOWN_MS) return;
 
     processingSet.add(userId);
 
     try {
-        // Fetch current rank to verify rank status and ignore higher ranks
         const currentRank = await withRetry(
             () => noblox.getRankInGroup(GROUP_ID, userId),
             `getRankInGroup ${userId}`
         );
 
-        // Strictly rank only if Rank 1
         if (currentRank === BASE_RANK_ID) {
-            console.log(`\n[DETECTED RANK 1] ${username} (${userId}) is Rank ${BASE_RANK_ID}`);
-            console.log(`[RANKING] Ranking ${username} (${userId}) → Rank ${TARGET_RANK_ID}...`);
+            console.log(`[RANKING] ${username} (${userId}): Rank ${BASE_RANK_ID} to Rank ${TARGET_RANK_ID}`);
 
             const result = await withRetry(
                 () => noblox.setRank(GROUP_ID, userId, TARGET_RANK_ID),
                 `setRank ${userId}`
             );
 
-            const newRoleName = result?.name || result?.newRole?.name || `Rank ${TARGET_RANK_ID}`;
-            console.log(
-                `[SUCCESS] Ranked ${username} (${userId}) → ${newRoleName}`
-            );
-            recentlyRanked.set(userId, Date.now());
-        } else if (currentRank > BASE_RANK_ID) {
-            // Strictly ignore higher ranks
-            console.log(
-                `[IGNORED] ${username} (${userId}) is Rank ${currentRank} (higher than Rank ${BASE_RANK_ID}). Ignoring.`
-            );
-            recentlyRanked.set(userId, Date.now());
-        } else {
-            // Rank 0 (guest / not in group)
-            recentlyRanked.set(userId, Date.now());
+            const newName = result?.name || result?.newRole?.name || `Rank ${TARGET_RANK_ID}`;
+            console.log(`[RANKING] Done: ${username} (${userId}) is now ${newName}`);
+            markRanked(userId);
+
+            const fromName = roleNames[BASE_RANK_ID] || `Rank ${BASE_RANK_ID}`;
+            const toName = roleNames[TARGET_RANK_ID] || `Rank ${TARGET_RANK_ID}`;
+            queueRankLog(username, fromName, toName, 'promotion');
         }
+        recentlyRanked.set(userId, Date.now());
     } catch (err) {
-        const details =
-            err?.errors ||
-            err?.response?.data ||
-            err?.message ||
-            err;
-        console.error(`[FAILED] ${username} (${userId}):`, details);
+        const details = err?.errors || err?.response?.data || err?.message || err;
+        console.error(`[RANKING] Failed for ${username} (${userId}):`, details);
     } finally {
         processingSet.delete(userId);
     }
 }
 
 // ==================================================
-// AUDIT LOG HELPERS
+// MANUAL RANK CHANGES (read from the group audit log)
+// Staff promotions and demotions done on Roblox are logged
+// in the same format. The bot's own rank-ups are skipped here
+// because rankMember() already logs those.
 // ==================================================
-function getAuditTargetName(desc) {
-    return (
-        desc?.TargetName ||
-        desc?.TargetUsername ||
-        desc?.Target?.name ||
-        desc?.Target?.username ||
-        'Unknown'
-    );
-}
+const AUDIT_INTERVAL_MS = 30000;
+let auditBotId = null;
+let lastAuditTime = Date.now(); // only changes made after startup are logged
+const seenAudit = new Set();
+const pendingRoles = new Map(); // targetId -> { target, assigned, unassigned, updated }
+let isAuditing = false;
 
-const usernameCache = new Map();
-async function resolveTargetName(desc) {
-    const name = getAuditTargetName(desc);
-    if (name !== 'Unknown') return name;
-    const id = getAuditTargetId(desc);
-    if (!id) return name;
-    if (usernameCache.has(String(id))) return usernameCache.get(String(id));
-    try {
-        const looked = await withRetry(() => noblox.getUsernameFromId(Number(id)), 'getUsernameFromId');
-        if (looked) {
-            usernameCache.set(String(id), looked);
-            return looked;
-        }
-    } catch (err) {
-        console.warn(`[AUDIT] Could not look up username for ${id}: ${err.message || err}`);
-    }
-    return `User ${id}`;
-}
-
-function getAuditTargetId(desc) {
-    return (
-        desc?.TargetId ||
-        desc?.TargetUserId ||
-        desc?.Target?.id ||
-        desc?.Target?.userId ||
-        null
-    );
-}
-
-function getRoleNameFromDesc(desc) {
-    return (
-        desc?.RoleSetName ||
-        desc?.RoleName ||
-        desc?.NewRoleSetName ||
-        desc?.OldRoleSetName ||
-        desc?.Role?.name ||
-        desc?.roleName ||
-        desc?.Name ||
-        null
-    );
-}
-
-function getAuditKey(entry) {
-    const desc = entry.description || {};
-    const created = entry.created
-        ? new Date(entry.created).getTime()
-        : '';
-    const action = entry.actionType || '';
-    const target = getAuditTargetId(desc) || '?';
-    const roleName = getRoleNameFromDesc(desc) || '';
-    const oldRank = desc.OldRoleSetName || desc.OldRank || '';
-    const newRank = desc.NewRoleSetName || desc.NewRank || '';
-
-    return [created, action, target, roleName, oldRank, newRank].join('|');
-}
-
-function normalizeActionType(actionType) {
-    if (!actionType) return '';
-    return String(actionType).replace(/\s+/g, '');
-}
-
-// ==================================================
-// RANK-CHANGE PAIRING
-// ==================================================
-async function tryCompleteRankChange(targetId) {
-    const pending = pendingRankChanges.get(String(targetId));
-    if (!pending) return;
-
-    if (!pending.unassignRole || !pending.assignRole) {
-        return;
-    }
-
-    const oldRole = pending.unassignRole;
-    const newRole = pending.assignRole;
-    const targetName = pending.targetName || 'Unknown';
-
-    const roles = await getRolesCached();
-    const oldRankNum = getRankNumberByName(roles, oldRole);
-    const newRankNum = getRankNumberByName(roles, newRole);
-
-    let changeType = 'Rank Change';
-    if (Number.isFinite(oldRankNum) && Number.isFinite(newRankNum)) {
-        if (newRankNum > oldRankNum) {
-            changeType = 'Promotion';
-        } else if (newRankNum < oldRankNum) {
-            changeType = 'Demotion';
-        }
-    }
-
-    addPendingLog(
-        `${targetName} → ${oldRole} to ${newRole} (${changeType})`
-    );
-
-    pendingRankChanges.delete(String(targetId));
-
-    // If new rank is Rank 1, trigger auto-rank to Rank 2
-    if (newRankNum === BASE_RANK_ID) {
-        console.log(`[AUDIT] User ${targetName} (${targetId}) was roled to Rank 1. Triggering auto-rank...`);
-        rankMember(Number(targetId), targetName);
-    }
-}
-
-async function handleUnassignRole(entry) {
-    const desc = entry.description || {};
-    const targetId = getAuditTargetId(desc);
-    const targetName = await resolveTargetName(desc);
-    const roleName = getRoleNameFromDesc(desc) || 'Unknown';
-
-    if (!targetId) {
-        console.warn('[AUDIT] Unassign Role missing TargetId – ignored');
-        return;
-    }
-
-    const key = String(targetId);
-    const existing = pendingRankChanges.get(key) || {};
-
-    existing.unassignRole = roleName;
-    existing.unassignTime = Date.now();
-    existing.targetName = targetName || existing.targetName;
-
-    pendingRankChanges.set(key, existing);
-    console.log(`[AUDIT] Buffered Unassign Role → ${targetName} lost "${roleName}"`);
-
-    await tryCompleteRankChange(targetId);
-}
-
-async function handleAssignRole(entry) {
-    const desc = entry.description || {};
-    const targetId = getAuditTargetId(desc);
-    const targetName = await resolveTargetName(desc);
-    const roleName = getRoleNameFromDesc(desc) || 'Unknown';
-
-    if (!targetId) {
-        console.warn('[AUDIT] Assign Role missing TargetId – ignored');
-        return;
-    }
-
-    const key = String(targetId);
-    const existing = pendingRankChanges.get(key) || {};
-
-    existing.assignRole = roleName;
-    existing.assignTime = Date.now();
-    existing.targetName = targetName || existing.targetName;
-
-    pendingRankChanges.set(key, existing);
-    console.log(`[AUDIT] Buffered Assign Role → ${targetName} gained "${roleName}"`);
-
-    await tryCompleteRankChange(targetId);
-
-    // If assigned Rank 1 directly, queue ranking
-    const roles = await getRolesCached();
-    const assignedRankNum = getRankNumberByName(roles, roleName);
-    if (assignedRankNum === BASE_RANK_ID) {
-        console.log(`[AUDIT] User ${targetName} (${targetId}) directly assigned Rank 1. Triggering auto-rank...`);
-        rankMember(Number(targetId), targetName);
-    }
-}
-
-function cleanupStaleRankPairs() {
-    const now = Date.now();
-    for (const [key, pending] of pendingRankChanges) {
-        const lastTime = Math.max(
-            pending.unassignTime || 0,
-            pending.assignTime || 0
-        );
-        if (now - lastTime > RANK_PAIR_TIMEOUT_MS) {
-            console.log(
-                `[AUDIT] Discarding unpaired rank change for user ${key}`
-            );
-            pendingRankChanges.delete(key);
-        }
-    }
-}
-
-// ==================================================
-// PROCESS ONE AUDIT ENTRY
-// ==================================================
-async function processAuditEntry(entry) {
-    const rawAction = entry.actionType || '';
-    const actionType = normalizeActionType(rawAction);
-    const desc = entry.description || {};
-    const targetName = await resolveTargetName(desc);
-    const targetId = getAuditTargetId(desc);
-
-    // ----------------------------------------------
-    // CLASSIC ChangeRank
-    // ----------------------------------------------
-    if (actionType === 'ChangeRank') {
-        const oldRank =
-            desc.OldRoleSetName ||
-            desc.OldRank ||
-            'Unknown';
-        const newRank =
-            desc.NewRoleSetName ||
-            desc.NewRank ||
-            'Unknown';
-
-        const roles = await getRolesCached();
-        const oldRankNumber = getRankNumberByName(roles, oldRank);
-        const newRankNumber = getRankNumberByName(roles, newRank);
-
-        let changeType = 'Rank Change';
-        if (Number.isFinite(oldRankNumber) && Number.isFinite(newRankNumber)) {
-            if (newRankNumber > oldRankNumber) changeType = 'Promotion';
-            else if (newRankNumber < oldRankNumber) changeType = 'Demotion';
-        }
-
-        addPendingLog(
-            `${targetName} → ${oldRank} to ${newRank} (${changeType})`
-        );
-
-        // If changed to Rank 1, auto-rank to Rank 2
-        if (newRankNumber === BASE_RANK_ID && targetId) {
-            console.log(`[AUDIT] User ${targetName} (${targetId}) changed to Rank 1. Triggering auto-rank...`);
-            rankMember(Number(targetId), targetName);
-        }
-        return;
-    }
-
-    // ----------------------------------------------
-    // Unassign Role + Assign Role pairing
-    // ----------------------------------------------
-    if (actionType === 'UnassignRole') {
-        await handleUnassignRole(entry);
-        return;
-    }
-
-    if (actionType === 'AssignRole') {
-        await handleAssignRole(entry);
-        return;
-    }
-
-    // ----------------------------------------------
-    // MEMBER REMOVED / EXILED
-    // ----------------------------------------------
-    if (actionType === 'RemoveMember') {
-        addPendingLog(`${targetName} → Exiled / Left`);
-        return;
-    }
-
-    // ----------------------------------------------
-    // JOIN REQUEST ACCEPTED
-    // ----------------------------------------------
-    if (actionType === 'AcceptJoinRequest') {
-        addPendingLog(`${targetName} → Joined`);
-        if (targetId) {
-            console.log(`[AUDIT] Member ${targetName} (${targetId}) joined. Triggering auto-rank...`);
-            rankMember(Number(targetId), targetName);
-        }
-        return;
-    }
-
-    // ----------------------------------------------
-    // JOIN REQUEST DECLINED
-    // ----------------------------------------------
-    if (actionType === 'DeclineJoinRequest') {
-        addPendingLog(`${targetName} → Join Request Declined`);
-        return;
-    }
-}
-
-// ==================================================
-// AUDIT LOG SCANNER
-// ==================================================
-let isCheckingAudit = false;
 async function checkAuditLog() {
-    if (isCheckingAudit) return;
-    isCheckingAudit = true;
+    if (isAuditing) return;
+    isAuditing = true;
+
     try {
-        const logs = await withRetry(
-            () => noblox.getAuditLog(GROUP_ID, null, null, 'Desc', 50),
+        const roles = await withRetry(() => noblox.getRoles(GROUP_ID), 'getRoles');
+        const roleById = new Map(roles.map((r) => [Number(r.id), r]));
+
+        const log = await withRetry(
+            () => noblox.getAuditLog(GROUP_ID, '', undefined, 'Desc', 25),
             'getAuditLog'
         );
+        const entries = (Array.isArray(log) ? log : log?.data || []).slice().reverse(); // oldest first
 
-        if (!logs || !Array.isArray(logs.data) || logs.data.length === 0) {
-            if (logs && Array.isArray(logs.data) && !auditLoggerReady) {
-                auditLoggerReady = true;
-                console.log('[AUDIT] Initial scan complete (no existing logs).');
-            }
-            return;
-        }
-
-        const entries = logs.data
-            .slice()
-            .sort(
-                (a, b) =>
-                    new Date(a.created).getTime() -
-                    new Date(b.created).getTime()
-            );
-
-        if (!auditLoggerReady) {
-            const newest = entries[entries.length - 1];
-            if (newest) {
-                lastAuditCreated = new Date(newest.created).getTime();
-                console.log(
-                    `[AUDIT] Initial scan complete. Ignoring ${entries.length} old logs.`
-                );
-                console.log(`[AUDIT] Starting from ${newest.created}`);
-            }
-
-            for (const entry of entries) {
-                processedAuditLogs.add(getAuditKey(entry));
-            }
-            auditLoggerReady = true;
-            return;
-        }
-
-        let newCount = 0;
+        let newest = lastAuditTime;
         for (const entry of entries) {
-            const createdTime = new Date(entry.created).getTime();
-            if (!Number.isFinite(createdTime)) continue;
+            const ts = Date.parse(entry.created);
+            if (!Number.isFinite(ts) || ts <= lastAuditTime) continue;
+            newest = Math.max(newest, ts);
 
-            if (
-                lastAuditCreated !== null &&
-                createdTime < lastAuditCreated
-            ) {
+            const d = entry.description || {};
+            const key = `${entry.created}|${d.TargetId}|${d.NewRoleSetId}|${entry.actionType}`;
+            if (seenAudit.has(key)) continue;
+            seenAudit.add(key);
+
+            const kind = String(entry.actionType).replace(/[^a-z]/gi, '').toLowerCase();
+
+            // The Roles system records a staff promotion as two entries: "Unassign Role" (old role)
+            // and "Assign Role" (new role). They are collected per member and paired up after this loop.
+            if (kind === 'assignrole' || kind === 'unassignrole') {
+                const aId = Number(entry.actor?.user?.userId || entry.actor?.user?.id);
+                if (aId && aId === auditBotId) continue;
+                if (!d.TargetId || !d.RoleSetName) continue;
+
+                const p = pendingRoles.get(d.TargetId) || {};
+                const info = { id: Number(d.RoleSetId), name: d.RoleSetName };
+                if (kind === 'assignrole') p.assigned = info;
+                else p.unassigned = info;
+                p.target = d.TargetName;
+                p.updated = Date.now();
+                pendingRoles.set(d.TargetId, p);
                 continue;
             }
 
-            const auditKey = getAuditKey(entry);
-            if (processedAuditLogs.has(auditKey)) {
+            if (kind !== 'changerank') {
+                console.log(`[AUDIT RAW] ${entry.actionType} | actor=${entry.actor?.user?.username} | ${JSON.stringify(d)}`);
                 continue;
             }
 
-            processedAuditLogs.add(auditKey);
+            const actorId = Number(entry.actor?.user?.userId || entry.actor?.user?.id);
+            if (actorId && actorId === auditBotId) continue;
 
-            if (
-                lastAuditCreated === null ||
-                createdTime > lastAuditCreated
-            ) {
-                lastAuditCreated = createdTime;
+            const oldRole = roleById.get(Number(d.OldRoleSetId));
+            const newRole = roleById.get(Number(d.NewRoleSetId));
+            const fromName = d.OldRoleSetName || oldRole?.name;
+            const toName = d.NewRoleSetName || newRole?.name;
+            const target = d.TargetName;
+            if (!target || !fromName || !toName) continue;
+
+            const type = oldRole && newRole && newRole.rank < oldRole.rank ? 'demotion' : 'promotion';
+            console.log(`[AUDIT] ${target}: ${fromName} -> ${toName} (${type})`);
+            queueRankLog(target, fromName, toName, type);
+        }
+        // Pair up assigned/unassigned roles into one "Old -> New" line
+        for (const [tid, p] of pendingRoles) {
+            const both = p.assigned && p.unassigned;
+            if (!both && Date.now() - p.updated < 90000) continue; // wait up to 90s for the other half
+            pendingRoles.delete(tid);
+
+            if (both) {
+                if (p.assigned.id === p.unassigned.id) continue; // removed and re-added, no net change
+                const oldRole = roleById.get(p.unassigned.id) || roles.find((r) => r.name === p.unassigned.name);
+                const newRole = roleById.get(p.assigned.id) || roles.find((r) => r.name === p.assigned.name);
+                const type = oldRole && newRole && newRole.rank < oldRole.rank ? 'demotion' : 'promotion';
+                console.log(`[AUDIT] ${p.target}: ${p.unassigned.name} -> ${p.assigned.name} (${type})`);
+                queueRankLog(p.target, p.unassigned.name, p.assigned.name, type);
+            } else {
+                // Only one half arrived, so there is no "from" or "to" role to show
+                const added = Boolean(p.assigned);
+                const role = (p.assigned || p.unassigned).name;
+                const color = added ? 32 : 31;
+                console.log(`[AUDIT] ${p.target}: ${role} (${added ? 'role added' : 'role removed'})`);
+                queueLog(p.target, `${role} (${added ? 'role added' : 'role removed'})`, color);
             }
-
-            newCount++;
-            console.log(`[AUDIT] New → ${entry.actionType}`);
-            await processAuditEntry(entry);
         }
-
-        if (newCount > 0) {
-            console.log(`[AUDIT] Found ${newCount} new audit entries`);
-        }
-
-        cleanupStaleRankPairs();
-
-        if (processedAuditLogs.size > 1500) {
-            const values = [...processedAuditLogs];
-            processedAuditLogs.clear();
-            for (const value of values.slice(-750)) {
-                processedAuditLogs.add(value);
-            }
-        }
+        lastAuditTime = newest;
     } catch (err) {
-        console.error('[AUDIT] Poll error:', err.message || err);
+        console.warn(`[AUDIT] Check failed: ${err?.message || err}`);
     } finally {
-        isCheckingAudit = false;
-    }
-}
-
-// ==================================================
-// START AUDIT LOGGER
-// ==================================================
-async function startAuditLogger() {
-    console.log('[SYSTEM] Audit Log scanner started');
-    console.log('[SYSTEM] Discord logs will be sent every 2 minutes');
-
-    await getRolesCached();
-    await checkAuditLog();
-
-    setInterval(checkAuditLog, AUDIT_CHECK_INTERVAL_MS);
-    setInterval(sendBatchedLogs, LOG_SEND_INTERVAL_MS);
-}
-
-// ==================================================
-// 2-HOUR STATUS UPDATE
-// ==================================================
-async function sendGroupStatus() {
-    try {
-        const group = await withRetry(
-            () => noblox.getGroup(GROUP_ID),
-            'getGroup'
-        );
-
-        const memberCount = group.memberCount || 'Unknown';
-        const groupName = group.name || 'Group';
-        const shout = group.shout?.body
-            ? group.shout.body.slice(0, 200)
-            : 'No shout';
-
-        const description =
-            `**Group:** ${groupName}\n` +
-            `**Members:** ${memberCount.toLocaleString()}\n` +
-            `**Current Shout:** ${shout}\n\n` +
-            `Bot is online and ranking Rank ${BASE_RANK_ID} → Rank ${TARGET_RANK_ID}`;
-
-        await sendDiscord(null, [
-            makeEmbed('📊 Group Status Update', description, 0x5865F2)
-        ]);
-
-        console.log('[STATUS] 2-hour group update sent');
-    } catch (err) {
-        console.error(
-            '[STATUS] Failed to send update:',
-            err.message || err
-        );
+        isAuditing = false;
     }
 }
 
 // ==================================================
 // MAIN
 // ==================================================
-async function startAutoRanker() {
+async function start() {
     try {
-        const currentUser = await noblox.setCookie(
-            process.env.ROBLOX_COOKIE
-        );
+        const currentUser = await noblox.setCookie(process.env.ROBLOX_COOKIE);
+        const botUserId = Number(currentUser.UserID || currentUser.id);
+        const botUsername = currentUser.UserName || currentUser.name;
 
-        botUserId = Number(
-            currentUser.UserID || currentUser.id
-        );
-        botUsername =
-            currentUser.UserName || currentUser.name;
+        console.log(`[SYSTEM] Logged in as ${botUsername} (${botUserId})`);
+        console.log(`[SYSTEM] Auto-ranking Rank ${BASE_RANK_ID} to Rank ${TARGET_RANK_ID} every ${CHECK_INTERVAL_MS}ms`);
 
-        console.log('==================================================');
-        console.log(`Bot Active: ${botUsername} (ID: ${botUserId})`);
-        console.log(
-            `Auto-ranking: Rank ${BASE_RANK_ID} → Rank ${TARGET_RANK_ID} (Ignoring Higher Ranks)`
-        );
-        console.log(`Rank Poll: ${CHECK_INTERVAL_MS}ms`);
-        console.log(`Discord Log Batch: 2 minutes`);
-        console.log('==================================================\n');
+        scheduleReports();
 
-        // Start logger
-        await startAuditLogger();
+        auditBotId = botUserId;
+        setInterval(checkAuditLog, AUDIT_INTERVAL_MS);
+        setInterval(flushLogQueue, LOG_FLUSH_MS);
 
-        // 2-hour status
-        setTimeout(() => sendGroupStatus(), 30000);
-        setInterval(sendGroupStatus, STATUS_INTERVAL_MS);
-
-        console.log(
-            '[SYSTEM] Bot is running. Waiting for Rank 1 members...\n'
-        );
-
-        // Auto-rank loop
         setInterval(async () => {
             if (isPolling) return;
             isPolling = true;
 
             try {
                 const rank1Members = await getRank1Members();
-                if (!rank1Members || rank1Members.length === 0) return;
+                if (!rank1Members) return;
 
                 const now = Date.now();
                 for (const [id, ts] of recentlyRanked) {
-                    if (now - ts > RANK_COOLDOWN_MS * 3) {
-                        recentlyRanked.delete(id);
-                    }
+                    if (now - ts > RANK_COOLDOWN_MS * 3) recentlyRanked.delete(id);
                 }
 
                 for (const player of rank1Members) {
                     const uid = getUserId(player);
-                    const username = getPlayerUsername(player);
                     if (!uid || uid === botUserId) continue;
-
                     if (!processingSet.has(uid)) {
-                        rankMember(uid, username);
+                        rankMember(uid, player.username || `User ${uid}`);
                     }
                 }
             } catch (err) {
-                console.warn(
-                    `[WARN] Loop error: ${err.message || err}`
-                );
+                console.warn(`[WARN] Loop error: ${err.message || err}`);
             } finally {
                 isPolling = false;
             }
         }, CHECK_INTERVAL_MS);
     } catch (error) {
-        console.error(
-            '[INITIALIZATION ERROR]',
-            error?.message || error
-        );
+        console.error('[INIT] Failed to start:', error?.message || error);
         process.exit(1);
     }
 }
 
-// ==================================================
-// ERROR HANDLERS
-// ==================================================
 process.on('unhandledRejection', (reason) => {
-    console.error(
-        '[UNHANDLED REJECTION]',
-        reason?.message || reason
-    );
+    console.error('[UNHANDLED REJECTION]', reason?.message || reason);
 });
-
-async function shutdown(signal) {
-    console.log(`[SYSTEM] ${signal} received, flushing logs...`);
-    try {
-        await Promise.race([sendBatchedLogs(), sleep(8000)]);
-    } finally {
-        process.exit(0);
-    }
-}
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-
 process.on('uncaughtException', (err) => {
-    console.error(
-        '[UNCAUGHT EXCEPTION]',
-        err?.message || err
-    );
+    console.error('[UNCAUGHT EXCEPTION]', err?.message || err);
 });
 
-// ==================================================
-// START
-// ==================================================
-startAutoRanker();
+start();
