@@ -9,8 +9,13 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 
 const BASE_RANK_ID = 1;
 const TARGET_RANK_ID = 2;
-const CHECK_INTERVAL_MS = 1500;
-const RANK_COOLDOWN_MS = 15000;
+// Roblox rate-limits group actions hard, so ranking is done one member at a time.
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS) || 20000;     // how often to look for rank 1 members
+const RANK_DELAY_MS = Number(process.env.RANK_DELAY_MS) || 4000;            // pause between two setRank calls
+const RATE_LIMIT_PAUSE_MS = Number(process.env.RATE_LIMIT_PAUSE_MS) || 60000; // first pause after a 429, doubles each time
+const MAX_RATE_LIMIT_PAUSE_MS = 10 * 60 * 1000;
+const FAIL_COOLDOWN_MS = 15 * 60 * 1000;                                    // don't retry a member that failed for this long
+const RANK_COOLDOWN_MS = 60 * 1000;
 const REPORT_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
 const MAX_RETRIES = 4;
 
@@ -38,11 +43,18 @@ if (!DISCORD_WEBHOOK_URL) {
 // ==================================================
 // STATE
 // ==================================================
-const processingSet = new Set();
 const recentlyRanked = new Map();
 let baseRoleSetId = null;
 let isPolling = false;
 let isReporting = false;
+
+// Ranking queue
+const rankQueue = [];
+const queuedIds = new Set();
+const failedUntil = new Map();
+let workerRunning = false;
+let pausedUntil = 0;
+let currentPauseMs = 0;
 
 // ==================================================
 // SERVER FOR RENDER (keeps the web service alive)
@@ -206,43 +218,87 @@ async function getRank1Members() {
         );
         return Array.isArray(members) ? members : [];
     } catch (err) {
-        console.warn(`[WARN] getRank1Members failed: ${err.message || err}`);
+        if (isRateLimited(err)) {
+            pauseForRateLimit();
+        } else {
+            console.warn(`[WARN] getRank1Members failed: ${err.message || err}`);
+        }
         return null;
     }
 }
 
+function isRateLimited(err) {
+    const status = err?.httpStatusCode || err?.statusCode || err?.response?.status;
+    return status === 429 || /too many requests/i.test(err?.message || '');
+}
+
+function pauseForRateLimit() {
+    currentPauseMs = Math.min(
+        currentPauseMs ? currentPauseMs * 2 : RATE_LIMIT_PAUSE_MS,
+        MAX_RATE_LIMIT_PAUSE_MS
+    );
+    pausedUntil = Date.now() + currentPauseMs;
+    console.warn(`[RATE LIMIT] Roblox said slow down. Pausing for ${Math.round(currentPauseMs / 1000)}s`);
+}
+
+// Returns 'ok', 'failed' or 'rate_limited'
 async function rankMember(userId, username) {
-    if (processingSet.has(userId)) return;
-
-    const lastRanked = recentlyRanked.get(userId);
-    if (lastRanked && Date.now() - lastRanked < RANK_COOLDOWN_MS) return;
-
-    processingSet.add(userId);
-
     try {
-        const currentRank = await withRetry(
-            () => noblox.getRankInGroup(GROUP_ID, userId),
-            `getRankInGroup ${userId}`
-        );
-
-        if (currentRank === BASE_RANK_ID) {
-            console.log(`[RANKING] ${username} (${userId}): Rank ${BASE_RANK_ID} to Rank ${TARGET_RANK_ID}`);
-
-            const result = await withRetry(
-                () => noblox.setRank(GROUP_ID, userId, TARGET_RANK_ID),
-                `setRank ${userId}`
-            );
-
-            const newName = result?.name || result?.newRole?.name || `Rank ${TARGET_RANK_ID}`;
-            console.log(`[RANKING] Done: ${username} (${userId}) is now ${newName}`);
-        }
+        console.log(`[RANKING] ${username} (${userId}): Rank ${BASE_RANK_ID} to Rank ${TARGET_RANK_ID}`);
+        const result = await noblox.setRank(GROUP_ID, userId, TARGET_RANK_ID);
+        const newName = result?.name || result?.newRole?.name || `Rank ${TARGET_RANK_ID}`;
+        console.log(`[RANKING] Done: ${username} (${userId}) is now ${newName}`);
         recentlyRanked.set(userId, Date.now());
+        currentPauseMs = 0; // a success means the limit has cleared
+        return 'ok';
     } catch (err) {
+        if (isRateLimited(err)) {
+            return 'rate_limited';
+        }
         const details = err?.errors || err?.response?.data || err?.message || err;
         console.error(`[RANKING] Failed for ${username} (${userId}):`, details);
-    } finally {
-        processingSet.delete(userId);
+        failedUntil.set(userId, Date.now() + FAIL_COOLDOWN_MS);
+        return 'failed';
     }
+}
+
+async function runRankWorker() {
+    if (workerRunning) return;
+    workerRunning = true;
+
+    try {
+        while (rankQueue.length > 0) {
+            const wait = pausedUntil - Date.now();
+            if (wait > 0) {
+                await sleep(Math.min(wait, 5000));
+                continue;
+            }
+
+            const item = rankQueue.shift();
+            const outcome = await rankMember(item.uid, item.username);
+
+            if (outcome === 'rate_limited') {
+                rankQueue.unshift(item); // try this one again after the pause
+                pauseForRateLimit();
+                continue;
+            }
+
+            queuedIds.delete(item.uid);
+            await sleep(RANK_DELAY_MS);
+        }
+    } finally {
+        workerRunning = false;
+    }
+}
+
+function enqueueMember(uid, username) {
+    if (queuedIds.has(uid)) return;
+    if ((failedUntil.get(uid) || 0) > Date.now()) return;
+    const last = recentlyRanked.get(uid);
+    if (last && Date.now() - last < RANK_COOLDOWN_MS) return;
+
+    queuedIds.add(uid);
+    rankQueue.push({ uid, username });
 }
 
 // ==================================================
@@ -255,12 +311,14 @@ async function start() {
         const botUsername = currentUser.UserName || currentUser.name;
 
         console.log(`[SYSTEM] Logged in as ${botUsername} (${botUserId})`);
-        console.log(`[SYSTEM] Auto-ranking Rank ${BASE_RANK_ID} to Rank ${TARGET_RANK_ID} every ${CHECK_INTERVAL_MS}ms`);
+        console.log(`[SYSTEM] Auto-ranking Rank ${BASE_RANK_ID} to Rank ${TARGET_RANK_ID}, one member every ${RANK_DELAY_MS / 1000}s`);
 
         scheduleReports();
 
         setInterval(async () => {
             if (isPolling) return;
+            // Don't look for more work while paused or while the queue is still being worked through
+            if (Date.now() < pausedUntil || rankQueue.length > 0) return;
             isPolling = true;
 
             try {
@@ -271,20 +329,26 @@ async function start() {
                 for (const [id, ts] of recentlyRanked) {
                     if (now - ts > RANK_COOLDOWN_MS * 3) recentlyRanked.delete(id);
                 }
+                for (const [id, until] of failedUntil) {
+                    if (until < now) failedUntil.delete(id);
+                }
 
                 for (const player of rank1Members) {
                     const uid = getUserId(player);
                     if (!uid || uid === botUserId) continue;
-                    if (!processingSet.has(uid)) {
-                        rankMember(uid, player.username || `User ${uid}`);
-                    }
+                    enqueueMember(uid, player.username || `User ${uid}`);
+                }
+
+                if (rankQueue.length > 0) {
+                    console.log(`[SYSTEM] ${rankQueue.length} member(s) waiting to be ranked`);
+                    runRankWorker();
                 }
             } catch (err) {
                 console.warn(`[WARN] Loop error: ${err.message || err}`);
             } finally {
                 isPolling = false;
             }
-        }, CHECK_INTERVAL_MS);
+        }, POLL_INTERVAL_MS);
     } catch (error) {
         console.error('[INIT] Failed to start:', error?.message || error);
         process.exit(1);
