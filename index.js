@@ -16,7 +16,9 @@ const MAX_RETRIES = 4;
 
 // Remembers the last reported member count so a restart doesn't reset the change figure.
 // On hosts with a temporary disk (Render free tier) this resets on redeploy, which is fine.
-const STATE_FILE = path.join(__dirname, 'state.json');
+// Set DATA_DIR to a Render persistent-disk mount path (e.g. /data) if you add one.
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+const STATE_FILE = path.join(DATA_DIR, 'state.json');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -77,7 +79,7 @@ async function withRetry(fn, label = 'API call') {
                 ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN', 'ENOTFOUND'].includes(err?.code) ||
                 /InternalServerError|Internal Server Error|Too many requests|socket hang up|timed? ?out/i.test(msg);
             if (transient && attempt < MAX_RETRIES) {
-                const delay = 1200 * attempt;
+                const delay = (status === 429 ? 5000 : 1200) * attempt;
                 console.warn(`[RETRY ${attempt}/${MAX_RETRIES}] ${label}: ${status || err?.code || 'transient error'}. Waiting ${delay}ms`);
                 await sleep(delay);
                 continue;
@@ -273,24 +275,37 @@ async function getRank1Members() {
 
 // Members the bot has already ranked are remembered on disk, so a restart (or a staff
 // change that still leaves them showing as rank 1) never makes the bot rank them again.
-const RANKED_FILE = path.join(__dirname, 'ranked.json');
+const RANKED_FILE = path.join(DATA_DIR, 'ranked.json');
 const RANKED_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 let rankedBefore = {};
 try { rankedBefore = JSON.parse(fs.readFileSync(RANKED_FILE, 'utf8')); } catch { rankedBefore = {}; }
 
-function markRanked(userId) {
-    rankedBefore[userId] = Date.now();
+function saveRanked() {
     try { fs.writeFileSync(RANKED_FILE, JSON.stringify(rankedBefore)); } catch {}
 }
 
+function markRanked(userId) {
+    rankedBefore[userId] = Date.now();
+    saveRanked();
+}
+
+// On a host with a temporary disk (Render) ranked.json is wiped on every deploy/restart, so the
+// bot would think every existing Rank 1 member is new and try to rank all of them.
+// To prevent that, the first poll after startup records everyone who is ALREADY Rank 1 and skips
+// them. Only people who show up as Rank 1 afterwards get ranked.
+// Set BASELINE_ON_START=false to turn this off (e.g. when you use a persistent disk).
+const BASELINE_ON_START = String(process.env.BASELINE_ON_START || 'true').toLowerCase() !== 'false';
+let baselineDone = !BASELINE_ON_START;
+
+// Returns true if it actually called the Roblox API (so the caller can pace itself)
 async function rankMember(userId, username) {
-    if (processingSet.has(userId)) return;
+    if (processingSet.has(userId)) return false;
 
     const prev = rankedBefore[userId];
-    if (prev && Date.now() - prev < RANKED_TTL_MS) return;
+    if (prev && Date.now() - prev < RANKED_TTL_MS) return false;
 
     const lastRanked = recentlyRanked.get(userId);
-    if (lastRanked && Date.now() - lastRanked < RANK_COOLDOWN_MS) return;
+    if (lastRanked && Date.now() - lastRanked < RANK_COOLDOWN_MS) return false;
 
     processingSet.add(userId);
 
@@ -323,6 +338,7 @@ async function rankMember(userId, username) {
     } finally {
         processingSet.delete(userId);
     }
+    return true;
 }
 
 // ==================================================
@@ -457,6 +473,23 @@ async function start() {
                 const rank1Members = await getRank1Members();
                 if (!rank1Members) return;
 
+                // First poll after startup: remember everyone already at Rank 1 and skip them
+                if (!baselineDone) {
+                    let count = 0;
+                    for (const player of rank1Members) {
+                        const uid = getUserId(player);
+                        if (!uid || uid === botUserId) continue;
+                        if (!rankedBefore[uid]) {
+                            rankedBefore[uid] = Date.now();
+                            count++;
+                        }
+                    }
+                    saveRanked();
+                    baselineDone = true;
+                    console.log(`[SYSTEM] Baseline: skipping ${count} member(s) who were already Rank ${BASE_RANK_ID} at startup`);
+                    return;
+                }
+
                 const now = Date.now();
                 for (const [id, ts] of recentlyRanked) {
                     if (now - ts > RANK_COOLDOWN_MS * 3) recentlyRanked.delete(id);
@@ -465,9 +498,9 @@ async function start() {
                 for (const player of rank1Members) {
                     const uid = getUserId(player);
                     if (!uid || uid === botUserId) continue;
-                    if (!processingSet.has(uid)) {
-                        rankMember(uid, player.username || `User ${uid}`);
-                    }
+                    // One at a time (not all at once) so Roblox doesn't rate-limit us with 429s
+                    const calledApi = await rankMember(uid, player.username || `User ${uid}`);
+                    if (calledApi) await sleep(700);
                 }
             } catch (err) {
                 console.warn(`[WARN] Loop error: ${err.message || err}`);
