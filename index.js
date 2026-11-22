@@ -5,7 +5,7 @@ const http = require('http');
 const GROUP_ID = parseInt(process.env.GROUP_ID, 10);
 const BASE_RANK_ID = 1;
 const TARGET_RANK_ID = 2;
-const CHECK_INTERVAL_MS = 1500;
+const CHECK_INTERVAL_MS = 2500; // 2.5s avoids aggressive Roblox 429 rate limiting
 const RANK_COOLDOWN_MS = 15000;
 const AUDIT_CHECK_INTERVAL_MS = 15000;
 const LOG_SEND_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
@@ -16,7 +16,7 @@ const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 // How long to keep an unpaired Unassign/Assign before discarding it
 const RANK_PAIR_TIMEOUT_MS = 90 * 1000;
 
-// Fail early with a clear message instead of a confusing noblox/fetch error later
+// Fail early with a clear message
 if (!Number.isInteger(GROUP_ID) || GROUP_ID <= 0) {
     console.error('[CONFIG] GROUP_ID is missing or not a number. Set it in your .env / Render environment.');
     process.exit(1);
@@ -34,6 +34,8 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // ==================================================
 // STATE
 // ==================================================
+let botUserId = null;
+let botUsername = null;
 const processingSet = new Set();
 const recentlyRanked = new Map();
 let baseRoleSetId = null;
@@ -47,9 +49,7 @@ const processedAuditLogs = new Set();
 // Logs waiting for the next 2-minute Discord message
 const pendingLogs = [];
 
-// Pending rank-change pairs:
-// key = targetUserId (string)
-// value = { unassignRole, assignRole, unassignTime, assignTime, targetName }
+// Pending rank-change pairs
 const pendingRankChanges = new Map();
 
 // Roles cache for accurate Promotion/Demotion detection
@@ -73,8 +73,19 @@ http.createServer((req, res) => {
 // ==================================================
 function getUserId(player) {
     if (!player) return null;
-    const id = player.userId || player.id;
+    const id = player.userId || player.id || player.user?.userId || player.user?.id;
     return id ? Number(id) : null;
+}
+
+function getPlayerUsername(player) {
+    if (!player) return 'Unknown';
+    return (
+        player.username ||
+        player.name ||
+        player.user?.username ||
+        player.user?.name ||
+        `User ${getUserId(player)}`
+    );
 }
 
 async function withRetry(fn, label = 'API call') {
@@ -144,39 +155,39 @@ async function processDiscordQueue() {
     isProcessingDiscord = true;
 
     try {
-    while (discordQueue.length > 0) {
-        const { content, embeds, resolve } = discordQueue.shift();
-        try {
-            const res = await fetch(DISCORD_WEBHOOK_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    content: content || undefined,
-                    embeds: embeds?.length ? embeds : undefined,
-                    username: 'Group Logger'
-                })
-            });
+        while (discordQueue.length > 0) {
+            const { content, embeds, resolve } = discordQueue.shift();
+            try {
+                const res = await fetch(DISCORD_WEBHOOK_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        content: content || undefined,
+                        embeds: embeds?.length ? embeds : undefined,
+                        username: 'Group Logger'
+                    })
+                });
 
-            if (res.status === 429) {
-                let retryAfter = Number(res.headers.get('Retry-After') || 5);
-                if (retryAfter > 60) retryAfter = 60;
-                console.warn(`[DISCORD] Rate limited. Waiting ${retryAfter}s...`);
-                discordQueue.unshift({ content, embeds, resolve });
-                await sleep(retryAfter * 1000);
-                continue;
-            }
+                if (res.status === 429) {
+                    let retryAfter = Number(res.headers.get('Retry-After') || 5);
+                    if (retryAfter > 60) retryAfter = 60;
+                    console.warn(`[DISCORD] Rate limited. Waiting ${retryAfter}s...`);
+                    discordQueue.unshift({ content, embeds, resolve });
+                    await sleep(retryAfter * 1000);
+                    continue;
+                }
 
-            if (!res.ok) {
-                const text = await res.text();
-                throw new Error(`Discord ${res.status}: ${text}`);
+                if (!res.ok) {
+                    const text = await res.text();
+                    throw new Error(`Discord ${res.status}: ${text}`);
+                }
+                resolve(true);
+            } catch (err) {
+                console.error('[DISCORD] Failed to send:', err.message || err);
+                resolve(false);
             }
-            resolve(true);
-        } catch (err) {
-            console.error('[DISCORD] Failed to send:', err.message || err);
-            resolve(false);
+            await sleep(1500);
         }
-        await sleep(1500);
-    }
     } finally {
         isProcessingDiscord = false;
     }
@@ -207,7 +218,7 @@ function makeEmbed(title, description, color = 0x5865F2) {
 }
 
 // ==================================================
-// ADD SIMPLE LOG
+// LOG QUEUE
 // ==================================================
 function addPendingLog(message) {
     if (!message) return;
@@ -215,9 +226,6 @@ function addPendingLog(message) {
     console.log(`[LOG QUEUED] ${message}`);
 }
 
-// ==================================================
-// SEND BATCHED LOGS EVERY 2 MINUTES
-// ==================================================
 let isSendingLogs = false;
 const MAX_PENDING_LOGS = 500;
 
@@ -228,15 +236,13 @@ async function sendBatchedLogs() {
     isSendingLogs = true;
 
     try {
-        // Remove duplicate lines while preserving order
         const uniqueLogs = [...new Set(pendingLogs)];
         pendingLogs.length = 0;
 
         if (!DISCORD_WEBHOOK_URL) {
-            return; // already printed to the console when queued
+            return;
         }
 
-        // Split into several embeds so nothing is dropped (embed description limit is 4096)
         const chunks = [];
         let current = [];
         let length = 0;
@@ -260,7 +266,6 @@ async function sendBatchedLogs() {
                 makeEmbed(title, chunks[i].join('\n'), 0x5865F2)
             ]);
             if (!ok) {
-                // Put the unsent logs back so they go out in the next batch
                 const unsent = chunks.slice(i).flat();
                 pendingLogs.unshift(...unsent);
                 if (pendingLogs.length > MAX_PENDING_LOGS) {
@@ -292,8 +297,9 @@ async function getRank1Members() {
             );
         }
 
+        // 'Desc' ensures newest members in Rank 1 are fetched first
         const members = await withRetry(
-            () => noblox.getPlayers(GROUP_ID, baseRoleSetId),
+            () => noblox.getPlayers(GROUP_ID, baseRoleSetId, 'Desc', 100),
             'getPlayers'
         );
         return Array.isArray(members) ? members : [];
@@ -304,6 +310,11 @@ async function getRank1Members() {
 }
 
 async function rankMember(userId, username) {
+    userId = Number(userId);
+    if (!userId || userId === botUserId) {
+        return;
+    }
+
     if (processingSet.has(userId)) {
         return;
     }
@@ -316,26 +327,35 @@ async function rankMember(userId, username) {
     processingSet.add(userId);
 
     try {
+        // Fetch current rank to verify rank status and ignore higher ranks
         const currentRank = await withRetry(
             () => noblox.getRankInGroup(GROUP_ID, userId),
             `getRankInGroup ${userId}`
         );
 
+        // Strictly rank only if Rank 1
         if (currentRank === BASE_RANK_ID) {
-            console.log(`\n[NEW MEMBER] ${username} (${userId}) is Rank 1`);
-            console.log(`[RANKING] ${username} → Rank ${TARGET_RANK_ID}...`);
+            console.log(`\n[DETECTED RANK 1] ${username} (${userId}) is Rank ${BASE_RANK_ID}`);
+            console.log(`[RANKING] Ranking ${username} (${userId}) → Rank ${TARGET_RANK_ID}...`);
 
             const result = await withRetry(
                 () => noblox.setRank(GROUP_ID, userId, TARGET_RANK_ID),
                 `setRank ${userId}`
             );
 
+            const newRoleName = result?.name || result?.newRole?.name || `Rank ${TARGET_RANK_ID}`;
             console.log(
-                `[SUCCESS] Ranked ${username} (${userId}) → ${result?.name || result?.newRole?.name || `Rank ${TARGET_RANK_ID}`}`
+                `[SUCCESS] Ranked ${username} (${userId}) → ${newRoleName}`
             );
             recentlyRanked.set(userId, Date.now());
-            // Discord message is handled by the audit logger
+        } else if (currentRank > BASE_RANK_ID) {
+            // Strictly ignore higher ranks
+            console.log(
+                `[IGNORED] ${username} (${userId}) is Rank ${currentRank} (higher than Rank ${BASE_RANK_ID}). Ignoring.`
+            );
+            recentlyRanked.set(userId, Date.now());
         } else {
+            // Rank 0 (guest / not in group)
             recentlyRanked.set(userId, Date.now());
         }
     } catch (err) {
@@ -431,7 +451,6 @@ async function tryCompleteRankChange(targetId) {
     const pending = pendingRankChanges.get(String(targetId));
     if (!pending) return;
 
-    // Need both sides
     if (!pending.unassignRole || !pending.assignRole) {
         return;
     }
@@ -440,7 +459,6 @@ async function tryCompleteRankChange(targetId) {
     const newRole = pending.assignRole;
     const targetName = pending.targetName || 'Unknown';
 
-    // Look up real rank numbers
     const roles = await getRolesCached();
     const oldRankNum = getRankNumberByName(roles, oldRole);
     const newRankNum = getRankNumberByName(roles, newRole);
@@ -459,6 +477,12 @@ async function tryCompleteRankChange(targetId) {
     );
 
     pendingRankChanges.delete(String(targetId));
+
+    // If new rank is Rank 1, trigger auto-rank to Rank 2
+    if (newRankNum === BASE_RANK_ID) {
+        console.log(`[AUDIT] User ${targetName} (${targetId}) was roled to Rank 1. Triggering auto-rank...`);
+        rankMember(Number(targetId), targetName);
+    }
 }
 
 async function handleUnassignRole(entry) {
@@ -507,9 +531,16 @@ async function handleAssignRole(entry) {
     console.log(`[AUDIT] Buffered Assign Role → ${targetName} gained "${roleName}"`);
 
     await tryCompleteRankChange(targetId);
+
+    // If assigned Rank 1 directly, queue ranking
+    const roles = await getRolesCached();
+    const assignedRankNum = getRankNumberByName(roles, roleName);
+    if (assignedRankNum === BASE_RANK_ID) {
+        console.log(`[AUDIT] User ${targetName} (${targetId}) directly assigned Rank 1. Triggering auto-rank...`);
+        rankMember(Number(targetId), targetName);
+    }
 }
 
-// Clean up old unpaired entries
 function cleanupStaleRankPairs() {
     const now = Date.now();
     for (const [key, pending] of pendingRankChanges) {
@@ -534,9 +565,10 @@ async function processAuditEntry(entry) {
     const actionType = normalizeActionType(rawAction);
     const desc = entry.description || {};
     const targetName = await resolveTargetName(desc);
+    const targetId = getAuditTargetId(desc);
 
     // ----------------------------------------------
-    // CLASSIC ChangeRank (still supported)
+    // CLASSIC ChangeRank
     // ----------------------------------------------
     if (actionType === 'ChangeRank') {
         const oldRank =
@@ -561,6 +593,12 @@ async function processAuditEntry(entry) {
         addPendingLog(
             `${targetName} → ${oldRank} to ${newRank} (${changeType})`
         );
+
+        // If changed to Rank 1, auto-rank to Rank 2
+        if (newRankNumber === BASE_RANK_ID && targetId) {
+            console.log(`[AUDIT] User ${targetName} (${targetId}) changed to Rank 1. Triggering auto-rank...`);
+            rankMember(Number(targetId), targetName);
+        }
         return;
     }
 
@@ -590,6 +628,10 @@ async function processAuditEntry(entry) {
     // ----------------------------------------------
     if (actionType === 'AcceptJoinRequest') {
         addPendingLog(`${targetName} → Joined`);
+        if (targetId) {
+            console.log(`[AUDIT] Member ${targetName} (${targetId}) joined. Triggering auto-rank...`);
+            rankMember(Number(targetId), targetName);
+        }
         return;
     }
 
@@ -600,8 +642,6 @@ async function processAuditEntry(entry) {
         addPendingLog(`${targetName} → Join Request Declined`);
         return;
     }
-
-    // Everything else is ignored
 }
 
 // ==================================================
@@ -618,8 +658,6 @@ async function checkAuditLog() {
         );
 
         if (!logs || !Array.isArray(logs.data) || logs.data.length === 0) {
-            // An empty log on the first scan still counts as "ready", otherwise the
-            // first real entries would be mistaken for old history and skipped.
             if (logs && Array.isArray(logs.data) && !auditLoggerReady) {
                 auditLoggerReady = true;
                 console.log('[AUDIT] Initial scan complete (no existing logs).');
@@ -635,7 +673,6 @@ async function checkAuditLog() {
                     new Date(b.created).getTime()
             );
 
-        // First scan – remember existing logs, send nothing
         if (!auditLoggerReady) {
             const newest = entries[entries.length - 1];
             if (newest) {
@@ -653,9 +690,7 @@ async function checkAuditLog() {
             return;
         }
 
-        // New logs
         let newCount = 0;
-
         for (const entry of entries) {
             const createdTime = new Date(entry.created).getTime();
             if (!Number.isFinite(createdTime)) continue;
@@ -692,7 +727,6 @@ async function checkAuditLog() {
 
         cleanupStaleRankPairs();
 
-        // Prevent the duplicate Set from growing forever
         if (processedAuditLogs.size > 1500) {
             const values = [...processedAuditLogs];
             processedAuditLogs.clear();
@@ -713,15 +747,10 @@ async function checkAuditLog() {
 async function startAuditLogger() {
     console.log('[SYSTEM] Audit Log scanner started');
     console.log('[SYSTEM] Discord logs will be sent every 2 minutes');
-    console.log('[SYSTEM] Group asset logs are ignored');
-    console.log(
-        '[SYSTEM] Rank changes detected via Unassign Role + Assign Role pairs'
-    );
 
-    // Pre-load roles so the first rank change is accurate
     await getRolesCached();
-
     await checkAuditLog();
+
     setInterval(checkAuditLog, AUDIT_CHECK_INTERVAL_MS);
     setInterval(sendBatchedLogs, LOG_SEND_INTERVAL_MS);
 }
@@ -770,16 +799,16 @@ async function startAutoRanker() {
             process.env.ROBLOX_COOKIE
         );
 
-        const botUserId = Number(
+        botUserId = Number(
             currentUser.UserID || currentUser.id
         );
-        const botUsername =
+        botUsername =
             currentUser.UserName || currentUser.name;
 
         console.log('==================================================');
         console.log(`Bot Active: ${botUsername} (ID: ${botUserId})`);
         console.log(
-            `Auto-ranking: Rank ${BASE_RANK_ID} → Rank ${TARGET_RANK_ID}`
+            `Auto-ranking: Rank ${BASE_RANK_ID} → Rank ${TARGET_RANK_ID} (Ignoring Higher Ranks)`
         );
         console.log(`Rank Poll: ${CHECK_INTERVAL_MS}ms`);
         console.log(`Discord Log Batch: 2 minutes`);
@@ -803,7 +832,7 @@ async function startAutoRanker() {
 
             try {
                 const rank1Members = await getRank1Members();
-                if (!rank1Members) return;
+                if (!rank1Members || rank1Members.length === 0) return;
 
                 const now = Date.now();
                 for (const [id, ts] of recentlyRanked) {
@@ -814,13 +843,11 @@ async function startAutoRanker() {
 
                 for (const player of rank1Members) {
                     const uid = getUserId(player);
+                    const username = getPlayerUsername(player);
                     if (!uid || uid === botUserId) continue;
 
                     if (!processingSet.has(uid)) {
-                        rankMember(
-                            uid,
-                            player.username || `User ${uid}`
-                        );
+                        rankMember(uid, username);
                     }
                 }
             } catch (err) {
