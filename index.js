@@ -14,6 +14,14 @@ const RANK_COOLDOWN_MS = 15000;
 const REPORT_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2 hours
 const MAX_RETRIES = 4;
 
+// Who gets pinged when the bot goes to sleep / shuts down.
+// "<@ID>" pings a USER. If this ID is a ROLE, use "<@&ID>" instead (set SLEEP_PING in Render's Environment tab).
+const SLEEP_PING = process.env.SLEEP_PING || '<@679398959822929920>';
+
+// Render sets this automatically on web services. Used for the keep-alive ping.
+const SELF_URL = process.env.RENDER_EXTERNAL_URL;
+const KEEPALIVE_INTERVAL_MS = 10 * 60 * 1000; // Render sleeps free services after ~15 min without web traffic
+
 // Remembers the last reported member count so a restart doesn't reset the change figure.
 // On hosts with a temporary disk (Render free tier) this resets on redeploy, which is fine.
 // Set DATA_DIR to a Render persistent-disk mount path (e.g. /data) if you add one.
@@ -46,17 +54,34 @@ const roleNames = {}; // rank number -> role name, used for the promotion log
 let baseRoleSetId = null;
 let isPolling = false;
 let isReporting = false;
+let isShuttingDown = false;
 
 // ==================================================
 // SERVER FOR RENDER (keeps the web service alive)
 // ==================================================
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
+const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('REPD ranker is running');
-}).listen(PORT, () => {
+});
+server.listen(PORT, () => {
     console.log(`[SYSTEM] Web server listening on port ${PORT}`);
 });
+
+// Keep-alive: the bot calls its own public URL so Render sees web traffic and does not put it to sleep.
+// This only works while the bot is awake. Add an outside pinger (UptimeRobot / cron-job.org) as a backup.
+function startKeepAlive() {
+    if (!SELF_URL) {
+        console.log('[KEEPALIVE] RENDER_EXTERNAL_URL not set (not running on Render?). Self-ping disabled.');
+        return;
+    }
+    setInterval(() => {
+        fetch(SELF_URL)
+            .then((r) => r.text())
+            .catch((err) => console.warn('[KEEPALIVE] Ping failed:', err.message || err));
+    }, KEEPALIVE_INTERVAL_MS);
+    console.log(`[KEEPALIVE] Pinging ${SELF_URL} every ${KEEPALIVE_INTERVAL_MS / 60000} minutes`);
+}
 
 // ==================================================
 // HELPERS
@@ -107,19 +132,27 @@ function saveState(state) {
 
 // ==================================================
 // DISCORD (plain text only)
+// options.ping     - true lets the message actually ping users/roles (normal logs never ping)
+// options.attempts - how many times to try (shutdown uses fewer so it finishes in time)
 // ==================================================
-async function sendDiscord(content) {
+async function sendDiscord(content, options = {}) {
+    const ping = Boolean(options.ping);
+    const attempts = options.attempts || MAX_RETRIES;
+
     if (!DISCORD_WEBHOOK_URL) {
         console.log(`[REPORT] ${content}`);
         return true;
     }
 
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    for (let attempt = 1; attempt <= attempts; attempt++) {
         try {
             const res = await fetch(DISCORD_WEBHOOK_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ content })
+                body: JSON.stringify({
+                    content,
+                    allowed_mentions: { parse: ping ? ['users', 'roles'] : [] }
+                })
             });
 
             if (res.status === 429) {
@@ -133,8 +166,8 @@ async function sendDiscord(content) {
             }
             return true;
         } catch (err) {
-            console.error(`[DISCORD] Send failed (attempt ${attempt}/${MAX_RETRIES}):`, err.message || err);
-            await sleep(2000 * attempt);
+            console.error(`[DISCORD] Send failed (attempt ${attempt}/${attempts}):`, err.message || err);
+            if (attempt < attempts) await sleep(options.attempts ? 700 : 2000 * attempt);
         }
     }
     return false;
@@ -195,11 +228,47 @@ async function flushLogQueue() {
 }
 
 // ==================================================
+// SLEEP / SHUTDOWN NOTICE
+// Render stops a free service by sending SIGTERM (then force-kills it after a short grace period).
+// The bot uses that moment to post one last message that pings SLEEP_PING.
+// This also fires on redeploys and restarts, because from the bot's side they look the same.
+// A crash or a hard kill gives no warning, so no message can be sent in that case.
+// ==================================================
+async function handleShutdown(signal) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    console.log(`[SYSTEM] Received ${signal}. Sending sleep notice, then exiting.`);
+
+    // Never let the notice delay exit past Render's grace period
+    const hardExit = setTimeout(() => process.exit(0), 12000);
+    hardExit.unref?.();
+
+    try {
+        await flushLogQueue(); // push out any rank lines that were still waiting
+
+        const wake = SELF_URL ? ` Open ${SELF_URL} to wake it.` : '';
+        await sendDiscord(
+            `${SLEEP_PING} The REPD ranker is going to sleep (or restarting). ` +
+            `Auto-ranking and rank logs are paused until it starts again.${wake}`,
+            { ping: true, attempts: 3 }
+        );
+    } catch (err) {
+        console.error('[SYSTEM] Sleep notice failed:', err.message || err);
+    }
+
+    try { server.close(); } catch {}
+    process.exit(0);
+}
+
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('SIGINT', () => handleShutdown('SIGINT'));
+
+// ==================================================
 // 2-HOUR MEMBER REPORT
 // Format: Redwood Edge Police Department [REPD]: 126[+1]
 // ==================================================
 async function sendMemberReport() {
-    if (isReporting) return;
+    if (isReporting || isShuttingDown) return;
     isReporting = true;
 
     try {
@@ -355,7 +424,7 @@ const pendingRoles = new Map(); // targetId -> { target, assigned, unassigned, u
 let isAuditing = false;
 
 async function checkAuditLog() {
-    if (isAuditing) return;
+    if (isAuditing || isShuttingDown) return;
     isAuditing = true;
 
     try {
@@ -459,6 +528,10 @@ async function start() {
         console.log(`[SYSTEM] Logged in as ${botUsername} (${botUserId})`);
         console.log(`[SYSTEM] Auto-ranking Rank ${BASE_RANK_ID} to Rank ${TARGET_RANK_ID} every ${CHECK_INTERVAL_MS}ms`);
 
+        // Every start means the bot was asleep, restarted or just deployed. Say so (no ping).
+        await sendDiscord('The REPD ranker is online. Changes made while it was asleep are not logged.');
+
+        startKeepAlive();
         scheduleReports();
 
         auditBotId = botUserId;
@@ -466,7 +539,7 @@ async function start() {
         setInterval(flushLogQueue, LOG_FLUSH_MS);
 
         setInterval(async () => {
-            if (isPolling) return;
+            if (isPolling || isShuttingDown) return;
             isPolling = true;
 
             try {
@@ -496,6 +569,7 @@ async function start() {
                 }
 
                 for (const player of rank1Members) {
+                    if (isShuttingDown) break;
                     const uid = getUserId(player);
                     if (!uid || uid === botUserId) continue;
                     // One at a time (not all at once) so Roblox doesn't rate-limit us with 429s
