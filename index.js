@@ -3,9 +3,18 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const noblox = require('noblox.js');
+const { Client, GatewayIntentBits, Events, ChannelType, SlashCommandBuilder } = require('discord.js');
 
 const GROUP_ID = parseInt(process.env.GROUP_ID, 10);
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
+
+// Discord bot (for the /promote, /demote, /setrank and /suspend commands)
+const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID;
+const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID;
+// RoWifi API token (RoWifi dashboard > Tokens). Used to find each staff member's linked Roblox account
+// so nobody can change their own rank. If it is empty, that check is switched off.
+const ROWIFI_TOKEN = process.env.ROWIFI_TOKEN;
 
 const BASE_RANK_ID = 1;
 const TARGET_RANK_ID = 2;
@@ -185,7 +194,8 @@ function queueLog(name, text, color) {
 }
 
 function queueRankLog(username, fromName, toName, type) {
-    queueLog(username, `${fromName} -> ${toName} (${type})`, type === 'demotion' ? 31 : 32); // 31 = red, 32 = green
+    const red = type === 'demotion' || type === 'suspension'; // 31 = red, 32 = green
+    queueLog(username, `${fromName} -> ${toName} (${type})`, red ? 31 : 32);
 }
 
 async function flushLogQueue() {
@@ -256,6 +266,7 @@ async function handleShutdown(signal) {
         console.error('[SYSTEM] Sleep notice failed:', err.message || err);
     }
 
+    try { await discordClient?.destroy(); } catch {}
     try { server.close(); } catch {}
     process.exit(0);
 }
@@ -516,6 +527,675 @@ async function checkAuditLog() {
     }
 }
 
+let discordClient = null;
+
+// ==================================================
+// DISCORD COMMANDS: /promote  /demote  /setrank  /suspend
+//
+// WHO CAN DO WHAT is defined in PERMISSION_TIERS below. Nothing else grants access:
+// no admin fallback, no environment variable, no extra roles. If a person has both roles,
+// the higher tier (Chief Rank) is used. Everything is checked again on the server side of the
+// bot, so hiding or showing a command in Discord never decides who is allowed.
+// ==================================================
+const EPHEMERAL = 64; // only the person who used the command sees the reply
+
+const MIN_MANAGED_RANK = 2; // nobody below this rank can be changed with the commands
+const SUSPEND_RANK = 3; // the rank /suspend puts people in
+// Where suspension reasons are posted. Set SUSPEND_THREAD_ID in your environment to the ID of the thread
+// (the last number in the thread's link). The value below is only used if the variable is missing.
+const SUSPEND_TARGET_ID = process.env.SUSPEND_THREAD_ID || '1574647908245045311';
+// Thread that records WHO ran each /promote, /demote and /setrank (e.g. "Promotions/demotions by Staff").
+// Set STAFF_LOG_THREAD_ID to that thread's ID. If it is empty, this extra log is simply skipped.
+const STAFF_LOG_THREAD_ID = process.env.STAFF_LOG_THREAD_ID;
+const MIN_REASON_LENGTH = 10; // a suspension reason must be at least this long
+const MAX_ACTIONS = 15; // rank changes one Discord user may make...
+const RATE_WINDOW_MS = 10 * 60 * 1000; // ...within this window (anti-misuse brake)
+const TARGET_COOLDOWN_MS = 10 * 60 * 1000; // the same member can't have their rank changed again for this long
+
+// Highest tier first. skipRanks: never used as a promote/demote step and never set by /setrank.
+// setRankOnly: ranks that skip rules hide from /promote and /demote but this tier may set with /setrank.
+const PERMISSION_TIERS = [
+    {
+        key: 'chief',
+        label: 'Chief Rank',
+        roleId: '1523857118531158136',
+        maxRank: 28,
+        skipRanks: [3, 4, 5, 6, 7, 13, 18, 23],
+        setRankOnly: [5, 6],
+        bypassTargetCooldown: true // Chief Rank can fix a mistake straight away
+    },
+    {
+        key: 'hq',
+        label: 'Police HQ',
+        roleId: '1523856189983559761',
+        maxRank: 22,
+        skipRanks: [3, 4, 5, 6, 7, 13, 18],
+        setRankOnly: [],
+        bypassTargetCooldown: false
+    }
+];
+
+function getTier(interaction) {
+    const roles = interaction.member?.roles;
+    const has = (id) => (Array.isArray(roles) ? roles.includes(id) : Boolean(roles?.cache?.has(id)));
+    return PERMISSION_TIERS.find((t) => has(t.roleId)) || null;
+}
+
+// A rank on the normal promote/demote ladder for this tier
+function isLadderRank(tier, rank) {
+    return rank >= MIN_MANAGED_RANK && rank <= tier.maxRank && !tier.skipRanks.includes(rank);
+}
+
+// A rank this tier may set with /setrank (ladder + its special ranks)
+function isSettableRank(tier, rank) {
+    return isLadderRank(tier, rank) || tier.setRankOnly.includes(rank);
+}
+
+// Group roles are cached so commands and autocomplete don't hit Roblox every time
+let rolesCache = { at: 0, roles: [] };
+async function getGroupRoles(force = false) {
+    if (!force && rolesCache.roles.length && Date.now() - rolesCache.at < 5 * 60 * 1000) return rolesCache.roles;
+    const roles = await withRetry(() => noblox.getRoles(GROUP_ID), 'getRoles');
+    for (const r of roles) roleNames[r.rank] = r.name;
+    rolesCache = { at: Date.now(), roles };
+    return roles;
+}
+
+// Simple per-person limit so one account can't mass-change ranks
+const actionTimes = new Map();
+function isRateLimited(discordUserId) {
+    const now = Date.now();
+    const recent = (actionTimes.get(discordUserId) || []).filter((t) => now - t < RATE_WINDOW_MS);
+    actionTimes.set(discordUserId, recent);
+    return recent.length >= MAX_ACTIONS;
+}
+function recordAction(discordUserId) {
+    const list = actionTimes.get(discordUserId) || [];
+    list.push(Date.now());
+    actionTimes.set(discordUserId, list);
+}
+
+// ---- RoWifi: which Roblox account is this Discord user linked to? ----
+const linkCache = new Map(); // discordId -> { id, at }
+const LINK_CACHE_MS = 10 * 60 * 1000;
+
+// Returns the linked Roblox user ID, or null if the person is not linked. Throws if RoWifi can't be reached.
+async function getLinkedRobloxId(discordId) {
+    const cached = linkCache.get(discordId);
+    if (cached && Date.now() - cached.at < LINK_CACHE_MS) return cached.id;
+
+    const res = await fetch(`https://api.rowifi.xyz/v3/guilds/${DISCORD_GUILD_ID}/members/${discordId}`, {
+        headers: { Authorization: `Bot ${ROWIFI_TOKEN}` },
+        signal: AbortSignal.timeout(8000)
+    });
+    if (res.status === 404) return null; // not linked
+    if (!res.ok) throw new Error(`RoWifi answered ${res.status}`);
+
+    const data = await res.json();
+    const id = Number(data?.roblox_id) || null;
+    if (id) linkCache.set(discordId, { id, at: Date.now() });
+    return id;
+}
+
+// ---- Misuse alerts: pings Chief Rank in the staff-log thread ----
+const CHIEF_ROLE_ID = PERMISSION_TIERS.find((t) => t.key === 'chief').roleId;
+const MISUSE_RULES = {
+    rate_limit: { threshold: 1, text: `hit the rank-change limit (${MAX_ACTIONS} changes in ${RATE_WINDOW_MS / 60000} minutes)` },
+    self_rank: { threshold: 1, text: 'tried to change their own rank' },
+    over_limit: { threshold: 5, text: 'keeps trying rank changes their role is not allowed to make' }
+};
+const misuseHits = new Map(); // "discordId:kind" -> timestamps
+const misuseLastAlert = new Map(); // "discordId:kind" -> time of the last alert
+
+async function getStaffLogThread() {
+    if (!STAFF_LOG_THREAD_ID || !discordClient) return null;
+    const thread = await discordClient.channels.fetch(STAFF_LOG_THREAD_ID);
+    if (!thread || !thread.isThread()) {
+        console.warn('[STAFF LOG] STAFF_LOG_THREAD_ID is not a thread.');
+        return null;
+    }
+    if (thread.archived) await thread.setArchived(false).catch(() => {});
+    return thread;
+}
+
+// kind: a key of MISUSE_RULES. The alert is only sent once the threshold is reached,
+// and the same person is not alerted for the same thing more than once per window.
+async function flagMisuse(interaction, tier, kind, detail = '') {
+    try {
+        const rule = MISUSE_RULES[kind];
+        const key = `${interaction.user.id}:${kind}`;
+        const now = Date.now();
+
+        const hits = (misuseHits.get(key) || []).filter((t) => now - t < RATE_WINDOW_MS);
+        hits.push(now);
+        misuseHits.set(key, hits);
+        if (hits.length < rule.threshold) return;
+        if (now - (misuseLastAlert.get(key) || 0) < RATE_WINDOW_MS) return;
+        misuseLastAlert.set(key, now);
+
+        console.warn(`[MISUSE] ${interaction.user.tag} (${interaction.user.id}) ${rule.text} ${detail}`);
+
+        const thread = await getStaffLogThread();
+        if (!thread) return;
+        await thread.send({
+            content:
+                `🚨 <@&${CHIEF_ROLE_ID}> **Possible misuse:** <@${interaction.user.id}> (${tier ? tier.label : 'no staff role'}) ${rule.text}.` +
+                `${detail ? `\n${detail}` : ''}\n<t:${Math.floor(now / 1000)}:f>`,
+            allowedMentions: { roles: [CHIEF_ROLE_ID], parse: [] }
+        });
+    } catch (err) {
+        console.error('[MISUSE] Could not post alert:', err?.message || err);
+    }
+}
+
+// Remembers when each member's rank was last changed with a command (resets when the bot restarts)
+const targetLastChanged = new Map();
+
+// Posts the suspension record. Returns { channel, url } so follow-up notes can go in the same place.
+// Normal case: SUSPEND_THREAD_ID is an existing thread, and the record is posted as a message in it.
+// Fallback: if the ID is a forum or text channel instead, a new thread is created in it for each suspension.
+async function postSuspensionRecord(title, content) {
+    const target = await discordClient.channels.fetch(SUSPEND_TARGET_ID);
+    if (!target) throw new Error('Suspension thread/channel not found');
+
+    if (target.isThread()) {
+        if (target.archived) await target.setArchived(false).catch(() => {});
+        const message = await target.send({ content, allowedMentions: { parse: [] } });
+        return { channel: target, url: message.url };
+    }
+
+    if (target.type === ChannelType.GuildForum) {
+        const thread = await target.threads.create({
+            name: title,
+            message: { content, allowedMentions: { parse: [] } },
+            reason: 'Roblox suspension record'
+        });
+        return { channel: thread, url: thread.url };
+    }
+    if (target.type === ChannelType.GuildText) {
+        const thread = await target.threads.create({
+            name: title,
+            autoArchiveDuration: 10080, // 7 days
+            type: ChannelType.PublicThread,
+            reason: 'Roblox suspension record'
+        });
+        await thread.send({ content, allowedMentions: { parse: [] } });
+        return { channel: thread, url: thread.url };
+    }
+    throw new Error(`Unsupported suspension target type (${target.type})`);
+}
+
+// Writes one line to the staff-log thread: which staff member used which command on whom.
+// A problem here never blocks or undoes the rank change.
+async function postStaffLog(interaction, tier, command, name, userId, fromName, toName, type) {
+    try {
+        const thread = await getStaffLogThread();
+        if (!thread) return;
+
+        const icon = type === 'promotion' ? '🟢' : '🔴';
+        const label = type === 'promotion' ? 'Promotion' : 'Demotion';
+        await thread.send({
+            content:
+                `${icon} **${label}**: **${name}** (Roblox ID ${userId}): ${fromName} → **${toName}**\n` +
+                `By <@${interaction.user.id}> (${tier.label}) using /${command} • <t:${Math.floor(Date.now() / 1000)}:f>`,
+            allowedMentions: { parse: [] }
+        });
+    } catch (err) {
+        console.error('[STAFF LOG] Could not post:', err?.message || err);
+    }
+}
+
+async function handleRankCommand(interaction, command) {
+    // ---- 1. Who is asking? ----
+    const tier = getTier(interaction);
+    if (interaction.guildId !== DISCORD_GUILD_ID || !tier) {
+        await interaction.reply({ content: 'You do not have permission to use this command.', flags: EPHEMERAL });
+        return;
+    }
+    if (isRateLimited(interaction.user.id)) {
+        await flagMisuse(interaction, tier, 'rate_limit', `Last command: /${command}`);
+        await interaction.reply({
+            content: `Slow down: you can make at most ${MAX_ACTIONS} rank changes every ${RATE_WINDOW_MS / 60000} minutes.`,
+            flags: EPHEMERAL
+        });
+        return;
+    }
+
+    await interaction.deferReply();
+    const reply = (msg) => interaction.editReply({ content: msg, allowedMentions: { parse: [] } });
+
+    const typedName = interaction.options.getString('username', true).trim();
+    const wantedRank = command === 'setrank' ? interaction.options.getInteger('rank', true) : null;
+    const reason = command === 'suspend' ? interaction.options.getString('reason', true).trim() : null;
+
+    if (reason !== null && reason.length < MIN_REASON_LENGTH) {
+        return reply(`Please give a proper reason (at least ${MIN_REASON_LENGTH} characters). Nobody was suspended.`);
+    }
+    if (wantedRank !== null && !isSettableRank(tier, wantedRank)) {
+        await flagMisuse(interaction, tier, 'over_limit', `Tried /setrank to rank ${wantedRank}`);
+        return reply(`Your **${tier.label}** role is not allowed to set rank ${wantedRank}.`);
+    }
+
+    try {
+        // ---- 2. Find the Roblox user ----
+        let userId = null;
+        try {
+            userId = Number(await withRetry(() => noblox.getIdFromUsername(typedName), `getIdFromUsername ${typedName}`));
+        } catch {
+            userId = null;
+        }
+        if (!userId) return reply(`Could not find a Roblox user named **${typedName}**.`);
+
+        // Nobody may change their own rank. Needs RoWifi to know which Roblox account is theirs.
+        if (ROWIFI_TOKEN) {
+            let ownRobloxId;
+            try {
+                ownRobloxId = await getLinkedRobloxId(interaction.user.id);
+            } catch (err) {
+                console.error('[ROWIFI] Lookup failed:', err?.message || err);
+                return reply('I could not check your linked Roblox account with RoWifi right now, so **nothing was changed**. Try again in a minute.');
+            }
+            if (!ownRobloxId) {
+                return reply('Your Discord account is not linked to Roblox with RoWifi, so I can not allow rank changes. Verify with RoWifi first. Nothing was changed.');
+            }
+            if (ownRobloxId === userId) {
+                await flagMisuse(interaction, tier, 'self_rank', `Command: /${command} on their own account (${typedName})`);
+                return reply("You can't change your own rank.");
+            }
+        }
+
+        // Same member can't be ranked again too soon (suspensions are never blocked by this)
+        if (command !== 'suspend' && !tier.bypassTargetCooldown) {
+            const last = targetLastChanged.get(userId);
+            if (last && Date.now() - last < TARGET_COOLDOWN_MS) {
+                const until = Math.ceil((last + TARGET_COOLDOWN_MS) / 1000);
+                return reply(
+                    `**${typedName}**'s rank was already changed recently, so it is locked for now. ` +
+                    `You can change it again <t:${until}:R>. A Chief Rank can override this.`
+                );
+            }
+        }
+
+        // Don't collide with the auto-ranker or another command working on the same user
+        if (processingSet.has(userId)) return reply('That user is being processed right now. Try again in a few seconds.');
+        processingSet.add(userId);
+
+        try {
+            // ---- 3. Look up ranks ----
+            const roles = await getGroupRoles();
+            const [botRank, currentRank, name] = await Promise.all([
+                withRetry(() => noblox.getRankInGroup(GROUP_ID, auditBotId), 'getRankInGroup bot'),
+                withRetry(() => noblox.getRankInGroup(GROUP_ID, userId), `getRankInGroup ${userId}`),
+                withRetry(() => noblox.getUsernameFromId(userId), `getUsernameFromId ${userId}`).catch(() => typedName)
+            ]);
+            const roleOf = (rank) => roles.find((r) => r.rank === rank);
+            const nameOf = (rank) => roleOf(rank)?.name || `Rank ${rank}`;
+
+            // ---- 4. Safety checks on the target ----
+            if (userId === auditBotId) return reply("I can't change my own rank.");
+            if (currentRank === 0) return reply(`**${name}** is not in the group.`);
+            if (currentRank >= botRank) return reply(`I can't change **${name}**: their rank is equal to or higher than mine.`);
+
+            if (currentRank === SUSPEND_RANK) {
+                return reply(
+                    command === 'suspend'
+                        ? `**${name}** is already suspended.`
+                        : `**${name}** is suspended (rank ${SUSPEND_RANK}). Ranks of suspended members can't be changed with this command.`
+                );
+            }
+
+            // Promote/demote only work from a rank on the ladder. /setrank and /suspend may also touch special ranks.
+            const canTouchCurrent = command === 'promote' || command === 'demote'
+                ? isLadderRank(tier, currentRank)
+                : isSettableRank(tier, currentRank);
+            if (!canTouchCurrent) {
+                await flagMisuse(interaction, tier, 'over_limit', `Tried /${command} on ${name} (rank ${currentRank})`);
+                return reply(
+                    `**${name}** is ${nameOf(currentRank)} (rank ${currentRank}). Your **${tier.label}** role is not allowed to change members at that rank.`
+                );
+            }
+
+            // ---- 5. Work out the new rank ----
+            const ladder = roles.map((r) => r.rank).filter((r) => isLadderRank(tier, r)).sort((a, b) => a - b);
+            let toRank;
+
+            if (command === 'promote') {
+                toRank = ladder.find((r) => r > currentRank);
+                if (toRank === undefined) return reply(`**${name}** is already at the highest rank you can promote to (${nameOf(currentRank)}).`);
+            } else if (command === 'demote') {
+                toRank = [...ladder].reverse().find((r) => r < currentRank);
+                if (toRank === undefined) return reply(`**${name}** is already at the lowest rank you can demote to (${nameOf(currentRank)}).`);
+            } else if (command === 'setrank') {
+                toRank = wantedRank;
+                if (!roleOf(toRank)) return reply(`There is no rank ${toRank} in the group.`);
+                if (toRank === currentRank) return reply(`**${name}** is already ${nameOf(toRank)}.`);
+                if (toRank === SUSPEND_RANK) return reply('Use /suspend to suspend someone.');
+            } else {
+                toRank = SUSPEND_RANK;
+                if (!roleOf(toRank)) return reply(`The suspension rank (${SUSPEND_RANK}) does not exist in the group.`);
+            }
+
+            if (toRank >= botRank) return reply(`I can't set **${name}** to ${nameOf(toRank)}: that rank is equal to or higher than mine.`);
+
+            const type = command === 'suspend' ? 'suspension' : toRank > currentRank ? 'promotion' : 'demotion';
+            let record = null;
+
+            // ---- 6. Suspensions need a written record BEFORE anything changes ----
+            if (command === 'suspend') {
+                const date = new Date().toISOString().slice(0, 10);
+                const title = `Suspension | ${name} | ${date}`.slice(0, 100);
+                const recordText =
+                    `**Suspension record**\n` +
+                    `**User:** ${name} (Roblox ID ${userId})\n` +
+                    `**Rank before:** ${nameOf(currentRank)} (rank ${currentRank})\n` +
+                    `**Suspended by:** <@${interaction.user.id}> (${tier.label})\n` +
+                    `**Time:** <t:${Math.floor(Date.now() / 1000)}:F>\n` +
+                    `**Reason:** ${reason}`;
+                try {
+                    record = await postSuspensionRecord(title, recordText);
+                } catch (err) {
+                    console.error('[COMMAND] Could not post suspension record:', err?.message || err);
+                    return reply(
+                        'I could not post in the suspension thread, so **nobody was suspended**. ' +
+                        'Check that SUSPEND_THREAD_ID is correct and that I can view that thread and send messages in it.'
+                    );
+                }
+            }
+
+            // ---- 7. Change the rank ----
+            try {
+                await withRetry(() => noblox.setRank(GROUP_ID, userId, toRank), `setRank ${userId}`);
+            } catch (err) {
+                console.error(`[COMMAND] setRank failed for ${name} (${userId}):`, err?.message || err);
+                if (record) await record.channel.send('⚠️ The rank change FAILED. The user was NOT suspended.').catch(() => {});
+                return reply('Roblox refused the rank change, so nothing was changed. Check the console for details.');
+            }
+
+            recordAction(interaction.user.id);
+            if (command !== 'suspend') targetLastChanged.set(userId, Date.now());
+            recentlyRanked.set(userId, Date.now());
+            if (currentRank === BASE_RANK_ID || toRank === BASE_RANK_ID) markRanked(userId);
+
+            // ---- 8. Log it (same format as the other rank logs; who ran the command goes to the console) ----
+            queueRankLog(name, nameOf(currentRank), nameOf(toRank), type);
+            console.log(
+                `[COMMAND] ${interaction.user.tag} (${interaction.user.id}, ${tier.label}) ${type}: ` +
+                `${name} (${userId}) ${nameOf(currentRank)} -> ${nameOf(toRank)}`
+            );
+            if (record) await record.channel.send(`✅ **${name}** was moved to **${nameOf(toRank)}**.`).catch(() => {});
+            if (command !== 'suspend') {
+                // Suspensions already name the staff member in the suspension thread
+                await postStaffLog(interaction, tier, command, name, userId, nameOf(currentRank), nameOf(toRank), type);
+            }
+
+            const arrow = `${nameOf(currentRank)} → **${nameOf(toRank)}**`;
+            if (command === 'suspend') return reply(`🚫 Suspended **${name}**: ${arrow}\nRecord: ${record.url}`);
+            return reply(`${type === 'promotion' ? '✅ Promoted' : '⬇️ Demoted'} **${name}**: ${arrow}`);
+        } finally {
+            processingSet.delete(userId);
+        }
+    } catch (err) {
+        console.error(`[COMMAND] ${command} failed:`, err?.errors || err?.message || err);
+        await reply('Something went wrong. Nothing was changed unless a confirmation above says so. Check the console for details.').catch(() => {});
+    }
+}
+
+// /rankinfo: read-only look at a member and what the person asking could do with them
+async function handleRankInfo(interaction) {
+    const tier = getTier(interaction);
+    if (interaction.guildId !== DISCORD_GUILD_ID || !tier) {
+        await interaction.reply({ content: 'You do not have permission to use this command.', flags: EPHEMERAL });
+        return;
+    }
+
+    await interaction.deferReply({ flags: EPHEMERAL });
+    const reply = (msg) => interaction.editReply({ content: msg, allowedMentions: { parse: [] } });
+    const typedName = interaction.options.getString('username', true).trim();
+
+    try {
+        let userId = null;
+        try {
+            userId = Number(await withRetry(() => noblox.getIdFromUsername(typedName), `getIdFromUsername ${typedName}`));
+        } catch {
+            userId = null;
+        }
+        if (!userId) return reply(`Could not find a Roblox user named **${typedName}**.`);
+
+        const roles = await getGroupRoles();
+        const [currentRank, name] = await Promise.all([
+            withRetry(() => noblox.getRankInGroup(GROUP_ID, userId), `getRankInGroup ${userId}`),
+            withRetry(() => noblox.getUsernameFromId(userId), `getUsernameFromId ${userId}`).catch(() => typedName)
+        ]);
+        const nameOf = (rank) => roles.find((r) => r.rank === rank)?.name || `Rank ${rank}`;
+
+        if (currentRank === 0) return reply(`**${name}** (Roblox ID ${userId}) is not in the group.`);
+
+        const lines = [`**${name}** (Roblox ID ${userId})`, `Rank: **${nameOf(currentRank)}** (rank ${currentRank})`];
+
+        if (currentRank === SUSPEND_RANK) {
+            lines.push('Status: suspended. Their rank can not be changed with the commands.');
+        } else if (!isSettableRank(tier, currentRank)) {
+            lines.push(`Your **${tier.label}** role is not allowed to change members at this rank.`);
+        } else {
+            const ladder = roles.map((r) => r.rank).filter((r) => isLadderRank(tier, r)).sort((a, b) => a - b);
+            if (isLadderRank(tier, currentRank)) {
+                const up = ladder.find((r) => r > currentRank);
+                const down = [...ladder].reverse().find((r) => r < currentRank);
+                lines.push(`You can promote them to: ${up === undefined ? 'nothing (highest you can reach)' : `**${nameOf(up)}** (rank ${up})`}`);
+                lines.push(`You can demote them to: ${down === undefined ? 'nothing (lowest you can reach)' : `**${nameOf(down)}** (rank ${down})`}`);
+            } else {
+                lines.push('They are at a special rank, so only /setrank can change them.');
+            }
+
+            const last = targetLastChanged.get(userId);
+            if (!tier.bypassTargetCooldown && last && Date.now() - last < TARGET_COOLDOWN_MS) {
+                lines.push(`Locked: their rank was changed recently. Open again <t:${Math.ceil((last + TARGET_COOLDOWN_MS) / 1000)}:R>.`);
+            }
+        }
+        return reply(lines.join('\n'));
+    } catch (err) {
+        console.error('[COMMAND] rankinfo failed:', err?.errors || err?.message || err);
+        await reply('Something went wrong while looking that up. Check the console for details.').catch(() => {});
+    }
+}
+
+// /staffsummary: counts who did how many promotions, demotions and suspensions, read back from the log threads.
+// Discord itself is the storage, so the numbers survive restarts. Chief Rank only.
+async function readThreadMessages(thread, sinceMs) {
+    const found = [];
+    let before;
+    for (let page = 0; page < 30; page++) {
+        const batch = await thread.messages.fetch({ limit: 100, ...(before ? { before } : {}) });
+        if (batch.size === 0) break;
+        let reachedOld = false;
+        for (const msg of batch.values()) {
+            if (msg.createdTimestamp < sinceMs) {
+                reachedOld = true;
+                continue;
+            }
+            found.push(msg);
+        }
+        before = batch.last().id;
+        if (reachedOld) break;
+    }
+    return found;
+}
+
+async function handleStaffSummary(interaction) {
+    const tier = getTier(interaction);
+    if (interaction.guildId !== DISCORD_GUILD_ID || !tier || tier.key !== 'chief') {
+        await interaction.reply({ content: 'Only Chief Rank can use this command.', flags: EPHEMERAL });
+        return;
+    }
+    if (!STAFF_LOG_THREAD_ID) {
+        await interaction.reply({ content: 'STAFF_LOG_THREAD_ID is not set, so there is nothing to summarise.', flags: EPHEMERAL });
+        return;
+    }
+
+    await interaction.deferReply();
+    const days = interaction.options.getInteger('days') || 7;
+    const since = Date.now() - days * 24 * 60 * 60 * 1000;
+    const stats = new Map(); // discordId -> { promotions, demotions, suspensions }
+    const bump = (id, field) => {
+        const row = stats.get(id) || { promotions: 0, demotions: 0, suspensions: 0 };
+        row[field] += 1;
+        stats.set(id, row);
+    };
+
+    try {
+        // Promotions and demotions come from the staff-log thread
+        const staffThread = await getStaffLogThread();
+        if (!staffThread) return interaction.editReply('I can not open the staff-log thread. Check STAFF_LOG_THREAD_ID.');
+        for (const msg of await readThreadMessages(staffThread, since)) {
+            if (msg.author.id !== discordClient.user.id) continue;
+            const by = msg.content.match(/By <@(\d+)>/);
+            if (!by) continue;
+            if (msg.content.startsWith('🟢 **Promotion**')) bump(by[1], 'promotions');
+            else if (msg.content.startsWith('🔴 **Demotion**')) bump(by[1], 'demotions');
+        }
+
+        // Suspensions come from the suspension thread (only possible when it is an existing thread)
+        let suspensionNote = '';
+        const suspendThread = await discordClient.channels.fetch(SUSPEND_TARGET_ID).catch(() => null);
+        if (suspendThread && suspendThread.isThread()) {
+            for (const msg of await readThreadMessages(suspendThread, since)) {
+                if (msg.author.id !== discordClient.user.id) continue;
+                const by = msg.content.match(/\*\*Suspended by:\*\* <@(\d+)>/);
+                if (by) bump(by[1], 'suspensions');
+            }
+        } else {
+            suspensionNote = '\n(Suspensions are not included: SUSPEND_THREAD_ID is not a thread.)';
+        }
+
+        if (stats.size === 0) return interaction.editReply({ content: `No logged staff actions in the last ${days} day(s).${suspensionNote}`, allowedMentions: { parse: [] } });
+
+        const rows = [...stats.entries()]
+            .map(([id, r]) => ({ id, ...r, total: r.promotions + r.demotions + r.suspensions }))
+            .sort((a, b) => b.total - a.total);
+        const sum = (field) => rows.reduce((n, r) => n + r[field], 0);
+        const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+        const lines = rows.slice(0, 25).map(
+            (r) => `<@${r.id}>: ${plural(r.promotions, 'promotion')}, ${plural(r.demotions, 'demotion')}, ${plural(r.suspensions, 'suspension')} (${r.total} total)`
+        );
+        const content =
+            `**Staff summary: last ${days} day(s)**\n${lines.join('\n')}\n\n` +
+            `**Totals:** ${plural(sum('promotions'), 'promotion')}, ${plural(sum('demotions'), 'demotion')}, ${plural(sum('suspensions'), 'suspension')}` +
+            (rows.length > 25 ? `\n(Showing the top 25 of ${rows.length} staff.)` : '') +
+            suspensionNote;
+        return interaction.editReply({ content, allowedMentions: { parse: [] } });
+    } catch (err) {
+        console.error('[COMMAND] staffsummary failed:', err?.message || err);
+        return interaction.editReply('Could not read the log threads. Check that I can read message history in them.').catch(() => {});
+    }
+}
+
+// Suggests the ranks the person is allowed to set while they type in /setrank
+async function handleRankAutocomplete(interaction) {
+    const tier = getTier(interaction);
+    if (!tier || interaction.guildId !== DISCORD_GUILD_ID) return interaction.respond([]);
+
+    const typed = String(interaction.options.getFocused() || '').toLowerCase();
+    const choices = rolesCache.roles
+        .filter((r) => isSettableRank(tier, r.rank))
+        .filter((r) => `${r.rank} ${r.name}`.toLowerCase().includes(typed))
+        .sort((a, b) => a.rank - b.rank)
+        .slice(0, 25)
+        .map((r) => ({ name: `${r.rank} - ${r.name}`.slice(0, 100), value: r.rank }));
+    return interaction.respond(choices);
+}
+
+async function startDiscordBot() {
+    if (!DISCORD_BOT_TOKEN || !DISCORD_CLIENT_ID || !DISCORD_GUILD_ID) {
+        console.warn('[DISCORD] DISCORD_BOT_TOKEN, DISCORD_CLIENT_ID or DISCORD_GUILD_ID is missing. The rank commands are disabled.');
+        return;
+    }
+
+    if (!ROWIFI_TOKEN) {
+        console.warn('[ROWIFI] ROWIFI_TOKEN is not set. The "can\'t change your own rank" check is OFF.');
+    }
+    if (!STAFF_LOG_THREAD_ID) {
+        console.warn('[STAFF LOG] STAFF_LOG_THREAD_ID is not set. Staff log lines and misuse alerts will not be posted.');
+    }
+
+    const usernameOption = (o) => o.setName('username').setDescription('Roblox username').setRequired(true);
+    const commands = [
+        new SlashCommandBuilder()
+            .setName('promote')
+            .setDescription('Promote a Roblox user to the next rank')
+            .addStringOption(usernameOption),
+        new SlashCommandBuilder()
+            .setName('demote')
+            .setDescription('Demote a Roblox user to the previous rank')
+            .addStringOption(usernameOption),
+        new SlashCommandBuilder()
+            .setName('setrank')
+            .setDescription('Set a Roblox user to a specific rank')
+            .addStringOption(usernameOption)
+            .addIntegerOption((o) =>
+                o.setName('rank').setDescription('Rank to set').setRequired(true).setAutocomplete(true)
+            ),
+        new SlashCommandBuilder()
+            .setName('staffsummary')
+            .setDescription('Chief Rank only: promotions, demotions and suspensions per staff member')
+            .addIntegerOption((o) =>
+                o.setName('days').setDescription('How many days back (default 7)').setMinValue(1).setMaxValue(30)
+            ),
+        new SlashCommandBuilder()
+            .setName('rankinfo')
+            .setDescription('Look up a Roblox user\'s rank and what you can do with it (changes nothing)')
+            .addStringOption(usernameOption),
+        new SlashCommandBuilder()
+            .setName('suspend')
+            .setDescription('Suspend a Roblox user (the reason is recorded in the suspension thread)')
+            .addStringOption(usernameOption)
+            .addStringOption((o) =>
+                o.setName('reason').setDescription('Why they are being suspended').setRequired(true).setMaxLength(900)
+            )
+    ].map((c) => c.toJSON());
+
+    const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+    discordClient = client;
+
+    client.once(Events.ClientReady, async (c) => {
+        try {
+            const guild = await c.guilds.fetch(DISCORD_GUILD_ID);
+            await guild.commands.set(commands);
+            console.log(`[DISCORD] Logged in as ${c.user.tag}. Commands registered: /promote /demote /setrank /suspend /rankinfo /staffsummary`);
+        } catch (err) {
+            console.error('[DISCORD] Could not register commands:', err?.message || err);
+        }
+        await getGroupRoles().catch((err) => console.warn('[DISCORD] Could not preload group roles:', err?.message || err));
+    });
+
+    client.on(Events.InteractionCreate, async (interaction) => {
+        try {
+            if (interaction.isAutocomplete()) {
+                if (interaction.commandName === 'setrank') await handleRankAutocomplete(interaction);
+                return;
+            }
+            if (!interaction.isChatInputCommand()) return;
+            if (interaction.commandName === 'rankinfo') {
+                await handleRankInfo(interaction);
+            } else if (interaction.commandName === 'staffsummary') {
+                await handleStaffSummary(interaction);
+            } else if (['promote', 'demote', 'setrank', 'suspend'].includes(interaction.commandName)) {
+                await handleRankCommand(interaction, interaction.commandName);
+            }
+        } catch (err) {
+            console.error('[DISCORD] Interaction error:', err?.message || err);
+        }
+    });
+
+    client.on('error', (err) => console.error('[DISCORD] Client error:', err?.message || err));
+
+    try {
+        await client.login(DISCORD_BOT_TOKEN);
+    } catch (err) {
+        console.error('[DISCORD] Login failed:', err?.message || err);
+    }
+}
+
 // ==================================================
 // MAIN
 // ==================================================
@@ -535,6 +1215,7 @@ async function start() {
         scheduleReports();
 
         auditBotId = botUserId;
+        startDiscordBot(); // runs alongside the ranker; a Discord problem never stops the ranking
         setInterval(checkAuditLog, AUDIT_INTERVAL_MS);
         setInterval(flushLogQueue, LOG_FLUSH_MS);
 

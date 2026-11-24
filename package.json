@@ -9,6 +9,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "discord.js": "^14.28.1",
     "dotenv": "^16.4.5",
     "noblox.js": "^9.0.0"
   }
