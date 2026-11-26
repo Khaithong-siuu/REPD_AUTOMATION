@@ -620,12 +620,13 @@ const linkCache = new Map(); // discordId -> { id, at }
 const LINK_CACHE_MS = 10 * 60 * 1000;
 
 // Returns the linked Roblox user ID, or null if the person is not linked. Throws if RoWifi can't be reached.
-async function getLinkedRobloxId(discordId) {
-    const cached = linkCache.get(discordId);
+async function getLinkedRobloxId(discordId, guildId = DISCORD_GUILD_ID, token = ROWIFI_TOKEN) {
+    const cacheKey = `${guildId}:${discordId}`;
+    const cached = linkCache.get(cacheKey);
     if (cached && Date.now() - cached.at < LINK_CACHE_MS) return cached.id;
 
-    const res = await fetch(`https://api.rowifi.xyz/v3/guilds/${DISCORD_GUILD_ID}/members/${discordId}`, {
-        headers: { Authorization: `Bot ${ROWIFI_TOKEN}` },
+    const res = await fetch(`https://api.rowifi.xyz/v3/guilds/${guildId}/members/${discordId}`, {
+        headers: { Authorization: `Bot ${token}` },
         signal: AbortSignal.timeout(8000)
     });
     if (res.status === 404) return null; // not linked
@@ -633,7 +634,7 @@ async function getLinkedRobloxId(discordId) {
 
     const data = await res.json();
     const id = Number(data?.roblox_id) || null;
-    if (id) linkCache.set(discordId, { id, at: Date.now() });
+    if (id) linkCache.set(cacheKey, { id, at: Date.now() });
     return id;
 }
 
@@ -647,11 +648,11 @@ const MISUSE_RULES = {
 const misuseHits = new Map(); // "discordId:kind" -> timestamps
 const misuseLastAlert = new Map(); // "discordId:kind" -> time of the last alert
 
-async function getStaffLogThread() {
-    if (!STAFF_LOG_THREAD_ID || !discordClient) return null;
-    const thread = await discordClient.channels.fetch(STAFF_LOG_THREAD_ID);
+async function getStaffLogThread(threadId = STAFF_LOG_THREAD_ID) {
+    if (!threadId || !discordClient) return null;
+    const thread = await discordClient.channels.fetch(threadId);
     if (!thread || !thread.isThread()) {
-        console.warn('[STAFF LOG] STAFF_LOG_THREAD_ID is not a thread.');
+        console.warn(`[STAFF LOG] ${threadId} is not a thread.`);
         return null;
     }
     if (thread.archived) await thread.setArchived(false).catch(() => {});
@@ -660,7 +661,8 @@ async function getStaffLogThread() {
 
 // kind: a key of MISUSE_RULES. The alert is only sent once the threshold is reached,
 // and the same person is not alerted for the same thing more than once per window.
-async function flagMisuse(interaction, tier, kind, detail = '') {
+// ctx (optional) = { threadId, pingRoleId } to send the alert somewhere else, e.g. the divisional server
+async function flagMisuse(interaction, tier, kind, detail = '', ctx = null) {
     try {
         const rule = MISUSE_RULES[kind];
         const key = `${interaction.user.id}:${kind}`;
@@ -675,13 +677,14 @@ async function flagMisuse(interaction, tier, kind, detail = '') {
 
         console.warn(`[MISUSE] ${interaction.user.tag} (${interaction.user.id}) ${rule.text} ${detail}`);
 
-        const thread = await getStaffLogThread();
+        const thread = await getStaffLogThread(ctx?.threadId);
         if (!thread) return;
+        const pingRoleId = ctx?.pingRoleId || CHIEF_ROLE_ID;
         await thread.send({
             content:
-                `🚨 <@&${CHIEF_ROLE_ID}> **Possible misuse:** <@${interaction.user.id}> (${tier ? tier.label : 'no staff role'}) ${rule.text}.` +
+                `🚨 <@&${pingRoleId}> **Possible misuse:** <@${interaction.user.id}> (${tier ? tier.label : 'no staff role'}) ${rule.text}.` +
                 `${detail ? `\n${detail}` : ''}\n<t:${Math.floor(now / 1000)}:f>`,
-            allowedMentions: { roles: [CHIEF_ROLE_ID], parse: [] }
+            allowedMentions: { roles: [pingRoleId], parse: [] }
         });
     } catch (err) {
         console.error('[MISUSE] Could not post alert:', err?.message || err);
@@ -1117,6 +1120,9 @@ async function startDiscordBot() {
     if (!STAFF_LOG_THREAD_ID) {
         console.warn('[STAFF LOG] STAFF_LOG_THREAD_ID is not set. Staff log lines and misuse alerts will not be posted.');
     }
+    if (!DIV_ROWIFI_TOKEN) {
+        console.warn('[ROWIFI] DIV_ROWIFI_TOKEN is not set. The "can\'t change your own rank" check is OFF for the divisional commands.');
+    }
 
     const usernameOption = (o) => o.setName('username').setDescription('Roblox username').setRequired(true);
     const commands = [
@@ -1154,6 +1160,30 @@ async function startDiscordBot() {
             )
     ].map((c) => c.toJSON());
 
+    // Divisional commands live in the divisional server only
+    const unitOption = (o) =>
+        o.setName('unit').setDescription('Unit (you only see units you have the role for)').setRequired(true).setAutocomplete(true);
+    const divCommands = [
+        new SlashCommandBuilder()
+            .setName('divpromotion')
+            .setDescription('Promote someone one rank in a unit')
+            .addStringOption(unitOption)
+            .addStringOption(usernameOption),
+        new SlashCommandBuilder()
+            .setName('divdemotion')
+            .setDescription('Demote someone one rank in a unit')
+            .addStringOption(unitOption)
+            .addStringOption(usernameOption),
+        new SlashCommandBuilder()
+            .setName('divsetrank')
+            .setDescription('Set someone to a specific rank in a unit')
+            .addStringOption(unitOption)
+            .addStringOption(usernameOption)
+            .addIntegerOption((o) =>
+                o.setName('rank').setDescription('Unit rank to set').setRequired(true).setAutocomplete(true)
+            )
+    ].map((c) => c.toJSON());
+
     const client = new Client({ intents: [GatewayIntentBits.Guilds] });
     discordClient = client;
 
@@ -1166,12 +1196,33 @@ async function startDiscordBot() {
             console.error('[DISCORD] Could not register commands:', err?.message || err);
         }
         await getGroupRoles().catch((err) => console.warn('[DISCORD] Could not preload group roles:', err?.message || err));
+
+        try {
+            const divGuild = await c.guilds.fetch(DIV_GUILD_ID);
+            await divGuild.commands.set(divCommands);
+            console.log('[DISCORD] Divisional commands registered: /divpromotion /divdemotion /divsetrank');
+        } catch (err) {
+            console.warn('[DISCORD] Could not register the divisional commands (is the bot in the divisional server?):', err?.message || err);
+        }
+        await logDivisionSetup();
+    });
+
+    // If the bot is invited to the divisional server after it has started, register the commands right away
+    client.on(Events.GuildCreate, async (guild) => {
+        if (guild.id !== DIV_GUILD_ID || !client.isReady()) return;
+        try {
+            await guild.commands.set(divCommands);
+            console.log('[DISCORD] Joined the divisional server. Divisional commands registered.');
+        } catch (err) {
+            console.error('[DISCORD] Could not register the divisional commands:', err?.message || err);
+        }
     });
 
     client.on(Events.InteractionCreate, async (interaction) => {
         try {
             if (interaction.isAutocomplete()) {
                 if (interaction.commandName === 'setrank') await handleRankAutocomplete(interaction);
+                else if (['divpromotion', 'divdemotion', 'divsetrank'].includes(interaction.commandName)) await handleDivAutocomplete(interaction);
                 return;
             }
             if (!interaction.isChatInputCommand()) return;
@@ -1181,6 +1232,12 @@ async function startDiscordBot() {
                 await handleStaffSummary(interaction);
             } else if (['promote', 'demote', 'setrank', 'suspend'].includes(interaction.commandName)) {
                 await handleRankCommand(interaction, interaction.commandName);
+            } else if (interaction.commandName === 'divpromotion') {
+                await handleDivCommand(interaction, 'promote');
+            } else if (interaction.commandName === 'divdemotion') {
+                await handleDivCommand(interaction, 'demote');
+            } else if (interaction.commandName === 'divsetrank') {
+                await handleDivCommand(interaction, 'setrank');
             }
         } catch (err) {
             console.error('[DISCORD] Interaction error:', err?.message || err);
@@ -1193,6 +1250,430 @@ async function startDiscordBot() {
         await client.login(DISCORD_BOT_TOKEN);
     } catch (err) {
         console.error('[DISCORD] Login failed:', err?.message || err);
+    }
+}
+
+// ==================================================
+// DIVISIONAL COMMANDS: /divpromotion  /divdemotion  /divsetrank
+// Rank changes inside a unit's own Roblox group (EDU, SPU, TCU, SWAT), used from the divisional Discord server.
+// Some unit ranks also move the person in the MAIN group (Superintendent, Chief Superintendent, Inspectors).
+// Who can do what is defined in DIVISIONS below. Nothing else grants access.
+// ==================================================
+const DIV_GUILD_ID = process.env.DIV_GUILD_ID || '1524191959420243978';
+const DIV_LOG_THREAD_ID = process.env.DIV_LOG_THREAD_ID || '1575448141598031872';
+const DIV_ROWIFI_TOKEN = process.env.DIV_ROWIFI_TOKEN; // RoWifi token of the divisional server (not the main one)
+
+// <<pure-logic-start>>
+// Discord roles in the divisional server
+const DIV_OWNERSHIP_ROLE_ID = '1524213696711098428';
+const DIV_CHIEF_ROLE_ID = '1524201904152907957';
+const INSPECTOR_ROLE_ID = '1527250031890006016';
+const DEPUTY_INSPECTOR_ROLE_ID = '1527250131689275473';
+const CHIEF_INSPECTOR_ROLE_ID = '1527257243467382814';
+
+// Ranks in the MAIN REPD group that unit ranks are linked to
+const MAIN_SUPT_RANK = 21; // Superintendent
+const MAIN_CSUPT_RANK = 22; // Chief Superintendent
+const MAIN_DINS_RANK = 24; // Deputy Inspector
+const MAIN_INS_RANK = 25; // Inspector
+const MAIN_CINS_RANK = 26; // Chief Inspector
+const MAIN_LINKED_RANKS = [MAIN_SUPT_RANK, MAIN_CSUPT_RANK, MAIN_DINS_RANK, MAIN_INS_RANK, MAIN_CINS_RANK];
+const MAIN_COMMANDER_NAME = 'Commander'; // where people drop to when demoted below Superintendent
+
+// Per unit:
+//   groupId        the unit's Roblox group
+//   unitRoleId     Discord role that shows the person belongs to the unit (needed to see/use the unit at all)
+//   ownershipCap / chiefCap   highest rank the Ownership / Chief Ranks roles may set
+//   hq / hr        highest rank for the unit's Headquarters / HR roles. HQ is lowered to inspectorCap if the person also
+//                  holds the Inspector or Deputy Inspector role, and to cinsCap if they hold the Chief Inspector role.
+//   mergeSupt / mergeCsupt   unit ranks that also give Superintendent / Chief Superintendent in the main group
+const DIVISIONS = {
+    edu: {
+        key: 'edu', short: 'EDU', name: 'Education & Discipline Unit', groupId: 122215736,
+        unitRoleId: '1524197365609660436', ownershipCap: 10, chiefCap: 9,
+        hq: { roleId: '1527810562510164028', cap: 9, inspectorCap: 6, cinsCap: 8 },
+        hr: { roleId: '1535196587913908304', cap: 4 },
+        mergeSupt: 5, mergeCsupt: 6
+    },
+    spu: {
+        key: 'spu', short: 'SPU', name: 'Safety Protection Unit', groupId: 810808783,
+        unitRoleId: '1524197357128782008', ownershipCap: 10, chiefCap: 9,
+        hq: { roleId: '1530270371528310925', cap: 8, inspectorCap: 6, cinsCap: 8 },
+        hr: { roleId: '1535196059075219457', cap: 4 },
+        mergeSupt: 5, mergeCsupt: 6
+    },
+    tcu: {
+        key: 'tcu', short: 'TCU', name: 'Traffic Control Unit', groupId: 98199487,
+        unitRoleId: '1524197364955615374', ownershipCap: 9, chiefCap: 8,
+        hq: { roleId: '1530271120161509376', cap: 7, inspectorCap: 5, cinsCap: 7 },
+        hr: { roleId: '1535195855093628938', cap: 3 },
+        mergeSupt: 4, mergeCsupt: 5
+    },
+    swat: {
+        key: 'swat', short: 'SWAT', name: 'Special Weapons and Tactics', groupId: 980008030,
+        unitRoleId: '1524197366205386803', ownershipCap: 15, chiefCap: 14,
+        hq: { roleId: '1524202423370125525', cap: 13, inspectorCap: 11, cinsCap: 13 },
+        hr: { roleId: '1535196453754900480', cap: 8 },
+        mergeSupt: 9, mergeCsupt: 11
+    }
+};
+
+function memberHasRole(member, roleId) {
+    const roles = member?.roles;
+    return Array.isArray(roles) ? roles.includes(roleId) : Boolean(roles?.cache?.has(roleId));
+}
+
+// The best access this person has in one unit, or null. No unit role = no access, whatever else they hold.
+function divAccessFor(member, div) {
+    const has = (id) => memberHasRole(member, id);
+    if (!has(div.unitRoleId)) return null;
+
+    const options = [];
+    if (has(DIV_OWNERSHIP_ROLE_ID)) options.push({ cap: div.ownershipCap, label: 'Ownership', bypass: true });
+    if (has(DIV_CHIEF_ROLE_ID)) options.push({ cap: div.chiefCap, label: 'Chief Ranks', bypass: true });
+    if (has(div.hq.roleId)) {
+        let cap = div.hq.cap;
+        if (has(INSPECTOR_ROLE_ID) || has(DEPUTY_INSPECTOR_ROLE_ID)) cap = Math.min(cap, div.hq.inspectorCap);
+        if (has(CHIEF_INSPECTOR_ROLE_ID)) cap = Math.min(cap, div.hq.cinsCap);
+        options.push({ cap, label: `${div.short} Headquarters`, bypass: false });
+    }
+    if (has(div.hr.roleId)) options.push({ cap: div.hr.cap, label: `${div.short} HR`, bypass: false });
+
+    if (options.length === 0) return null;
+    return options.sort((a, b) => b.cap - a.cap)[0];
+}
+
+function resolveDivision(input) {
+    const v = String(input || '').trim().toLowerCase();
+    if (!v) return null;
+    return (
+        Object.values(DIVISIONS).find(
+            (d) => d.key === v || d.short.toLowerCase() === v || d.name.toLowerCase() === v || `${d.name} (${d.short})`.toLowerCase() === v
+        ) || null
+    );
+}
+
+// Works out what the person's MAIN group rank should become after their unit rank changes to newRank.
+// Returns { rank: number | null, error?: string }. rank null = leave the main rank alone.
+//  - below Superintendent level: only people currently on a unit-linked main rank drop to Commander
+//  - from Superintendent level up: Supt, Chief Supt, then Deputy Inspector / Inspector / Chief Inspector (found by role name)
+//  - above the last step (e.g. the unit's Chief Ranks role): no main change
+//  - a main rank outside the unit-linked ranks is never lowered
+function planMainChange(div, unitRoles, newRank, mainRank, mainRoles) {
+    const rankOfUnitRole = (regex) => {
+        const role = unitRoles.find((r) => regex.test(r.name));
+        return role ? role.rank : null;
+    };
+    const steps = [
+        { unit: div.mergeSupt, main: MAIN_SUPT_RANK },
+        { unit: div.mergeCsupt, main: MAIN_CSUPT_RANK },
+        { unit: rankOfUnitRole(/^Unit Deputy Inspector/i), main: MAIN_DINS_RANK },
+        { unit: rankOfUnitRole(/^Unit Inspector/i), main: MAIN_INS_RANK },
+        { unit: rankOfUnitRole(/^Unit Chief Inspector/i), main: MAIN_CINS_RANK }
+    ]
+        .filter((s) => s.unit !== null)
+        .sort((a, b) => a.unit - b.unit);
+
+    const linked = MAIN_LINKED_RANKS.includes(mainRank);
+
+    if (newRank < div.mergeSupt) {
+        if (!linked) return { rank: null };
+        const commander = mainRoles.find((r) => r.name.trim().toLowerCase() === MAIN_COMMANDER_NAME.toLowerCase());
+        if (!commander) return { rank: null, error: `The main group has no rank named "${MAIN_COMMANDER_NAME}".` };
+        return { rank: commander.rank };
+    }
+
+    if (newRank > steps[steps.length - 1].unit) return { rank: null };
+
+    let desired = null;
+    for (const step of steps) {
+        if (step.unit <= newRank) desired = step.main;
+    }
+    if (desired === null || desired === mainRank) return { rank: null };
+    if (desired < mainRank && !linked) return { rank: null };
+    return { rank: desired };
+}
+// <<pure-logic-end>>
+
+// Group roles of the unit groups (cached, like the main group's)
+const divRolesCache = new Map(); // groupId -> { at, roles }
+async function getRolesFor(groupId) {
+    const cached = divRolesCache.get(groupId);
+    if (cached && Date.now() - cached.at < 5 * 60 * 1000) return cached.roles;
+    const roles = await withRetry(() => noblox.getRoles(groupId), `getRoles ${groupId}`);
+    divRolesCache.set(groupId, { at: Date.now(), roles });
+    return roles;
+}
+
+const DIV_ALERT_CONTEXT = { threadId: DIV_LOG_THREAD_ID, pingRoleId: DIV_CHIEF_ROLE_ID };
+
+async function postDivLog(interaction, access, commandName, div, name, userId, fromName, toName, type, extraLine) {
+    try {
+        const thread = await getStaffLogThread(DIV_LOG_THREAD_ID);
+        if (!thread) return;
+        const icon = type === 'promotion' ? '🟢' : '🔴';
+        const label = type === 'promotion' ? 'Promotion' : 'Demotion';
+        await thread.send({
+            content:
+                `${icon} **${label}** (${div.short}): **${name}** (Roblox ID ${userId}): ${fromName} → **${toName}**\n` +
+                `${extraLine ? `${extraLine}\n` : ''}` +
+                `By <@${interaction.user.id}> (${access.label}) using /${commandName} • <t:${Math.floor(Date.now() / 1000)}:f>`,
+            allowedMentions: { parse: [] }
+        });
+    } catch (err) {
+        console.error('[DIV LOG] Could not post:', err?.message || err);
+    }
+}
+
+async function handleDivCommand(interaction, command) {
+    const commandName = command === 'promote' ? 'divpromotion' : command === 'demote' ? 'divdemotion' : 'divsetrank';
+
+    if (interaction.guildId !== DIV_GUILD_ID) {
+        await interaction.reply({ content: 'You do not have permission to use this command.', flags: EPHEMERAL });
+        return;
+    }
+
+    // ---- 1. Which unit, and what may this person do there? ----
+    const div = resolveDivision(interaction.options.getString('unit', true));
+    const access = div ? divAccessFor(interaction.member, div) : null;
+    if (!div || !access) {
+        await interaction.reply({ content: 'You do not have access to that unit.', flags: EPHEMERAL });
+        if (div) {
+            await flagMisuse(interaction, { label: 'no access to this unit' }, 'over_limit', `Tried /${commandName} for ${div.short}`, DIV_ALERT_CONTEXT);
+        }
+        return;
+    }
+    if (isRateLimited(interaction.user.id)) {
+        await flagMisuse(interaction, access, 'rate_limit', `Last command: /${commandName}`, DIV_ALERT_CONTEXT);
+        await interaction.reply({
+            content: `Slow down: you can make at most ${MAX_ACTIONS} rank changes every ${RATE_WINDOW_MS / 60000} minutes.`,
+            flags: EPHEMERAL
+        });
+        return;
+    }
+
+    await interaction.deferReply();
+    const reply = (msg) => interaction.editReply({ content: msg, allowedMentions: { parse: [] } });
+    const typedName = interaction.options.getString('username', true).trim();
+    const wantedRank = command === 'setrank' ? interaction.options.getInteger('rank', true) : null;
+
+    if (wantedRank !== null && (wantedRank < 1 || wantedRank > access.cap)) {
+        await flagMisuse(interaction, access, 'over_limit', `Tried /${commandName} to rank ${wantedRank} in ${div.short}`, DIV_ALERT_CONTEXT);
+        return reply(`Your **${access.label}** role can only set ranks 1 to ${access.cap} in ${div.short}.`);
+    }
+
+    try {
+        // ---- 2. Find the Roblox user ----
+        let userId = null;
+        try {
+            userId = Number(await withRetry(() => noblox.getIdFromUsername(typedName), `getIdFromUsername ${typedName}`));
+        } catch {
+            userId = null;
+        }
+        if (!userId) return reply(`Could not find a Roblox user named **${typedName}**.`);
+
+        // Nobody may change their own rank (RoWifi tells us which Roblox account is theirs)
+        if (DIV_ROWIFI_TOKEN) {
+            let ownRobloxId;
+            try {
+                ownRobloxId = await getLinkedRobloxId(interaction.user.id, DIV_GUILD_ID, DIV_ROWIFI_TOKEN);
+            } catch (err) {
+                console.error('[ROWIFI] Divisional lookup failed:', err?.message || err);
+                return reply('I could not check your linked Roblox account with RoWifi right now, so **nothing was changed**. Try again in a minute.');
+            }
+            if (!ownRobloxId) {
+                return reply('Your Discord account is not linked to Roblox with RoWifi, so I can not allow rank changes. Verify with RoWifi first. Nothing was changed.');
+            }
+            if (ownRobloxId === userId) {
+                await flagMisuse(interaction, access, 'self_rank', `Command: /${commandName} on their own account (${typedName})`, DIV_ALERT_CONTEXT);
+                return reply("You can't change your own rank.");
+            }
+        }
+
+        // Same member can't be ranked again too soon (Ownership and Chief Ranks skip this)
+        if (!access.bypass) {
+            const last = targetLastChanged.get(userId);
+            if (last && Date.now() - last < TARGET_COOLDOWN_MS) {
+                const until = Math.ceil((last + TARGET_COOLDOWN_MS) / 1000);
+                return reply(
+                    `**${typedName}**'s rank was already changed recently, so it is locked for now. ` +
+                    `You can change it again <t:${until}:R>. Ownership or Chief Ranks can override this.`
+                );
+            }
+        }
+
+        if (processingSet.has(userId)) return reply('That user is being processed right now. Try again in a few seconds.');
+        processingSet.add(userId);
+
+        try {
+            // ---- 3. Look up the unit group ----
+            const unitRoles = await getRolesFor(div.groupId);
+            const [botRank, currentRank, name] = await Promise.all([
+                withRetry(() => noblox.getRankInGroup(div.groupId, auditBotId), `getRankInGroup bot ${div.short}`),
+                withRetry(() => noblox.getRankInGroup(div.groupId, userId), `getRankInGroup ${div.short} ${userId}`),
+                withRetry(() => noblox.getUsernameFromId(userId), `getUsernameFromId ${userId}`).catch(() => typedName)
+            ]);
+            const unitNameOf = (rank) => unitRoles.find((r) => r.rank === rank)?.name || `Rank ${rank}`;
+
+            if (userId === auditBotId) return reply("I can't change my own rank.");
+            if (botRank === 0) return reply(`I am not in the ${div.name} group, so I can't change ranks there.`);
+            if (currentRank === 0) return reply(`**${name}** is not in the ${div.name} group.`);
+            if (currentRank >= botRank) return reply(`I can't change **${name}**: their rank in ${div.short} is equal to or higher than mine.`);
+
+            if (currentRank < 1 || currentRank > access.cap) {
+                await flagMisuse(interaction, access, 'over_limit', `Tried /${commandName} on ${name} (${div.short} rank ${currentRank})`, DIV_ALERT_CONTEXT);
+                return reply(
+                    `**${name}** is ${unitNameOf(currentRank)} (rank ${currentRank}) in ${div.short}. Your **${access.label}** role is not allowed to change members at that rank.`
+                );
+            }
+
+            // ---- 4. Work out the new unit rank ----
+            const ladder = unitRoles.map((r) => r.rank).filter((r) => r >= 1 && r <= access.cap).sort((a, b) => a - b);
+            if (!ladder.includes(currentRank)) return reply(`**${name}** has a ${div.short} rank (${currentRank}) I can't move.`);
+
+            let toRank;
+            if (command === 'promote') {
+                toRank = ladder.find((r) => r > currentRank);
+                if (toRank === undefined) return reply(`**${name}** is already at the highest ${div.short} rank you can promote to (${unitNameOf(currentRank)}).`);
+            } else if (command === 'demote') {
+                toRank = [...ladder].reverse().find((r) => r < currentRank);
+                if (toRank === undefined) return reply(`**${name}** is already at the lowest ${div.short} rank (${unitNameOf(currentRank)}).`);
+            } else {
+                toRank = wantedRank;
+                if (!ladder.includes(toRank)) return reply(`There is no rank ${toRank} in ${div.short}.`);
+                if (toRank === currentRank) return reply(`**${name}** is already ${unitNameOf(toRank)}.`);
+            }
+            if (toRank >= botRank) return reply(`I can't set **${name}** to ${unitNameOf(toRank)}: that rank is equal to or higher than mine.`);
+
+            // ---- 5. Check the main-group change BEFORE changing anything, so we never end up half done ----
+            const mainRoles = await getGroupRoles();
+            const [botMainRank, mainRank] = await Promise.all([
+                withRetry(() => noblox.getRankInGroup(GROUP_ID, auditBotId), 'getRankInGroup bot main'),
+                withRetry(() => noblox.getRankInGroup(GROUP_ID, userId), `getRankInGroup main ${userId}`)
+            ]);
+            const mainNameOf = (rank) => mainRoles.find((r) => r.rank === rank)?.name || `Rank ${rank}`;
+            const plan = planMainChange(div, unitRoles, toRank, mainRank, mainRoles);
+
+            if (plan.error) return reply(`${plan.error} Nothing was changed.`);
+            if (plan.rank !== null) {
+                if (mainRank === 0) return reply(`**${name}** is not in the main REPD group, so their main rank can't be updated. Nothing was changed.`);
+                if (mainRank >= botMainRank) return reply(`**${name}**'s main rank is equal to or higher than mine, so I can't update it. Nothing was changed.`);
+                if (plan.rank >= botMainRank || !mainRoles.some((r) => r.rank === plan.rank)) {
+                    return reply(`I can't set the main rank ${plan.rank} (${mainNameOf(plan.rank)}). Nothing was changed.`);
+                }
+            }
+
+            // ---- 6. Change the unit rank ----
+            try {
+                await withRetry(() => noblox.setRank(div.groupId, userId, toRank), `setRank ${div.short} ${userId}`);
+            } catch (err) {
+                console.error(`[COMMAND] ${div.short} setRank failed for ${name} (${userId}):`, err?.message || err);
+                return reply('Roblox refused the rank change, so nothing was changed. Check the console for details.');
+            }
+
+            // ---- 7. Change the main rank if the unit rank calls for it ----
+            let mainLine = '';
+            let mainFailed = false;
+            const type = toRank > currentRank ? 'promotion' : 'demotion';
+            if (plan.rank !== null) {
+                try {
+                    await withRetry(() => noblox.setRank(GROUP_ID, userId, plan.rank), `setRank main ${userId}`);
+                    mainLine = `Main group: ${mainNameOf(mainRank)} → **${mainNameOf(plan.rank)}**`;
+                    queueRankLog(name, mainNameOf(mainRank), mainNameOf(plan.rank), plan.rank > mainRank ? 'promotion' : 'demotion');
+                } catch (err) {
+                    mainFailed = true;
+                    mainLine = `⚠️ Main group change to ${mainNameOf(plan.rank)} FAILED. Set it by hand.`;
+                    console.error(`[COMMAND] Main setRank failed for ${name} (${userId}):`, err?.message || err);
+                }
+            }
+
+            recordAction(interaction.user.id);
+            targetLastChanged.set(userId, Date.now());
+            recentlyRanked.set(userId, Date.now());
+
+            // ---- 8. Log it ----
+            console.log(
+                `[COMMAND] ${interaction.user.tag} (${interaction.user.id}, ${access.label}) ${div.short} ${type}: ` +
+                `${name} (${userId}) ${unitNameOf(currentRank)} -> ${unitNameOf(toRank)}` +
+                `${plan.rank !== null ? ` | main ${mainNameOf(mainRank)} -> ${mainNameOf(plan.rank)}${mainFailed ? ' (FAILED)' : ''}` : ''}`
+            );
+            await postDivLog(interaction, access, commandName, div, name, userId, unitNameOf(currentRank), unitNameOf(toRank), type, mainLine);
+
+            const verb = type === 'promotion' ? '✅ Promoted' : '⬇️ Demoted';
+            return reply(
+                `${verb} **${name}** in **${div.short}**: ${unitNameOf(currentRank)} → **${unitNameOf(toRank)}**` +
+                `${mainLine ? `\n${mainLine}` : ''}`
+            );
+        } finally {
+            processingSet.delete(userId);
+        }
+    } catch (err) {
+        console.error(`[COMMAND] ${commandName} failed:`, err?.errors || err?.message || err);
+        await reply('Something went wrong. Nothing was changed unless a confirmation above says so. Check the console for details.').catch(() => {});
+    }
+}
+
+// Shows only the units the person has the unit role for, and only the ranks they may set
+async function handleDivAutocomplete(interaction) {
+    if (interaction.guildId !== DIV_GUILD_ID) return interaction.respond([]);
+    const focused = interaction.options.getFocused(true);
+    const typed = String(focused.value || '').toLowerCase();
+
+    if (focused.name === 'unit') {
+        const choices = Object.values(DIVISIONS)
+            .filter((d) => divAccessFor(interaction.member, d))
+            .filter((d) => `${d.name} ${d.short}`.toLowerCase().includes(typed))
+            .map((d) => ({ name: `${d.name} (${d.short})`, value: d.key }));
+        return interaction.respond(choices);
+    }
+
+    if (focused.name === 'rank') {
+        const div = resolveDivision(interaction.options.getString('unit'));
+        const access = div ? divAccessFor(interaction.member, div) : null;
+        const cached = div ? divRolesCache.get(div.groupId) : null;
+        if (!access || !cached) return interaction.respond([]);
+        const choices = cached.roles
+            .filter((r) => r.rank >= 1 && r.rank <= access.cap)
+            .filter((r) => `${r.rank} ${r.name}`.toLowerCase().includes(typed))
+            .sort((a, b) => a.rank - b.rank)
+            .slice(0, 25)
+            .map((r) => ({ name: `${r.rank} - ${r.name}`.slice(0, 100), value: r.rank }));
+        return interaction.respond(choices);
+    }
+    return interaction.respond([]);
+}
+
+// Prints every unit's ranks at startup so you can check the numbers against Roblox
+async function logDivisionSetup() {
+    for (const div of Object.values(DIVISIONS)) {
+        try {
+            const roles = await getRolesFor(div.groupId);
+            const botRank = await withRetry(() => noblox.getRankInGroup(div.groupId, auditBotId), `getRankInGroup bot ${div.short}`);
+            const list = roles
+                .filter((r) => r.rank > 0 && r.rank < 255)
+                .sort((a, b) => a.rank - b.rank)
+                .map((r) => `${r.rank} ${r.name}`)
+                .join(', ');
+            console.log(`[DIV] ${div.short} (group ${div.groupId}), bot rank ${botRank}: ${list}`);
+            if (botRank === 0) console.warn(`[DIV] ${div.short}: the bot is NOT in this group.`);
+            for (const need of [div.mergeSupt, div.mergeCsupt, div.hq.cap, div.ownershipCap]) {
+                if (!roles.some((r) => r.rank === need)) console.warn(`[DIV] ${div.short}: no role has rank ${need}, which the command rules mention.`);
+            }
+        } catch (err) {
+            console.warn(`[DIV] Could not read ${div.short} group ${div.groupId}:`, err?.message || err);
+        }
+    }
+
+    try {
+        const mainRoles = await getGroupRoles();
+        for (const rank of MAIN_LINKED_RANKS) {
+            if (!mainRoles.some((r) => r.rank === rank)) console.warn(`[DIV] Main group has no role with rank ${rank}.`);
+        }
+        if (!mainRoles.some((r) => r.name.trim().toLowerCase() === MAIN_COMMANDER_NAME.toLowerCase())) {
+            console.warn(`[DIV] Main group has no role named "${MAIN_COMMANDER_NAME}".`);
+        }
+    } catch (err) {
+        console.warn('[DIV] Could not check the main group roles:', err?.message || err);
     }
 }
 
